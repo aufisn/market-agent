@@ -11,7 +11,9 @@
 # the browser's WebCrypto, so the dashboard decrypts it with the same
 # passphrase (same scheme as Mandoos).
 #
-#   state_store.py pull                restore state into the app folder
+#   state_store.py pull [--app DIR]    restore state into the app folder
+#                                      (laptop: copies GitHub's latest results
+#                                      into ~/market-agent)
 #   state_store.py push                save state + dashboard bundle
 #   state_store.py seed --from DIR     first upload from the laptop install
 #
@@ -182,11 +184,11 @@ class Store:
 
 
 # ── COMMANDS ──────────────────────────────────────────────────
-def _passphrase(prompt=False):
+def _passphrase(prompt=False, confirm=True):
     p = os.getenv("MA_PASSPHRASE")
     if not p and prompt:
         p = getpass.getpass("Encryption passphrase: ")
-        if p != getpass.getpass("Same passphrase again: "):
+        if confirm and p != getpass.getpass("Same passphrase again: "):
             sys.exit("✗ The two passphrases differ")
     if not p or len(p) < 12:
         sys.exit("✗ Passphrase missing or shorter than 12 characters")
@@ -201,11 +203,12 @@ def _gh_token():
 
 
 def cmd_pull(args):
-    store = Store(os.getenv("MA_GIST_ID"), os.getenv("MA_GIST_TOKEN"))
+    # On the laptop: asks for the passphrase and uses the gh sign-in
+    store = Store(os.getenv("MA_GIST_ID"), os.getenv("MA_GIST_TOKEN") or _gh_token())
     text = store.read(STATE_FILE)
     if text is None:
         sys.exit("✗ No state in the Gist yet — run `state_store.py seed` from the laptop first")
-    n = unpack(decrypt(text, _passphrase()), args.app)
+    n = unpack(decrypt(text, _passphrase(prompt=True, confirm=False)), args.app)
     print(f"✓ State restored: {n} files")
 
 
