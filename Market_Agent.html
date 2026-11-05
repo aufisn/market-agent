@@ -856,6 +856,195 @@ var MC  = {"BULLISH":"#00C896","BEARISH":"#FF4D6A","NEUTRAL":"#F0A500"};
 var ME  = {"BULLISH":"📈","BEARISH":"📉","NEUTRAL":"➡️"};
 var RC  = ["#0EA5C9","#00C896","#F0A500","#FF4D6A","#BD6FFF","#4A90D9"];
 
+// ── GITHUB MODE ───────────────────────────────────────────────
+// On GitHub Pages (or with ?mode=github) there is no laptop server. The
+// dashboard's requests to /latest.json and /api/file are answered from
+// dashboard.enc in the secret Gist (written by ci/state_store.py after each
+// GitHub run), decrypted here with the passphrase. Same AES-256-GCM /
+// PBKDF2-SHA256 envelope as Mandoos. The Gist ID, token and passphrase stay
+// in this browser only. ?mode=local switches back.
+var GH_MODE = (function() {
+  var onPages = /\.github\.io$/.test(location.hostname);
+  try {
+    if (/[?&]mode=github\b/.test(location.search)) localStorage.setItem("ma_mode", "github");
+    if (/[?&]mode=local\b/.test(location.search)) localStorage.removeItem("ma_mode");
+    return onPages || localStorage.getItem("ma_mode") === "github";
+  } catch(e) { return onPages; }
+})();
+
+var GH = {
+  CFG_KEY: "ma_github_config",
+  PASS_KEY: "ma_github_pass",
+  API: "https://api.github.com",
+  bundle: null, version: null, checkedAt: 0, keys: {}, pending: null,
+
+  cfg: function() {
+    try { return JSON.parse(localStorage.getItem(GH.CFG_KEY) || "{}"); } catch(e) { return {}; }
+  },
+  pass: function() {
+    try { return sessionStorage.getItem(GH.PASS_KEY) || localStorage.getItem(GH.PASS_KEY) || ""; } catch(e) { return ""; }
+  },
+  connected: function() { var c = GH.cfg(); return !!(c.gistId && c.gistToken && GH.pass()); },
+
+  apiError: function(status) {
+    if (status === 401) return "GitHub rejected the Gist token (wrong or expired)";
+    if (status === 404) return "Gist not found — check the Gist ID";
+    if (status === 403) return "GitHub blocked the request (rate limit or token scope)";
+    return "GitHub returned HTTP " + status;
+  },
+
+  // dashboard.enc text + the Gist's updated_at
+  getGist: function() {
+    var c = GH.cfg();
+    return GH.origFetch(GH.API + "/gists/" + encodeURIComponent(c.gistId), {
+      cache: "no-store",
+      headers: {"Authorization": "token " + c.gistToken, "Accept": "application/vnd.github+json"}
+    })
+    .then(function(r) { if (!r.ok) throw new Error(GH.apiError(r.status)); return r.json(); })
+    .then(function(g) {
+      var f = (g.files || {})["dashboard.enc"];
+      if (!f) throw new Error("The Gist has no dashboard.enc yet — run Market Agent on GitHub once");
+      if (!f.truncated) return {text: f.content, updated: g.updated_at};
+      return GH.origFetch(f.raw_url, {cache: "no-store"})
+        .then(function(r) { if (!r.ok) throw new Error("Could not read the full Gist file"); return r.text(); })
+        .then(function(t) { return {text: t, updated: g.updated_at}; });
+    });
+  },
+
+  decrypt: function(text, passphrase) {
+    var env = JSON.parse(text), subtle = window.crypto && window.crypto.subtle;
+    if (!subtle) return Promise.reject(new Error("This browser can't decrypt (needs HTTPS)"));
+    var b = function(s) { return Uint8Array.from(atob(s), function(ch) { return ch.charCodeAt(0); }); };
+    var cacheKey = env.salt + ":" + env.iter;
+    var keyP = GH.keys[cacheKey] || subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"])
+      .then(function(base) {
+        return subtle.deriveKey({name: "PBKDF2", hash: "SHA-256", salt: b(env.salt), iterations: env.iter},
+                                base, {name: "AES-GCM", length: 256}, false, ["decrypt"]);
+      });
+    GH.keys = {}; GH.keys[cacheKey] = keyP;   // one envelope version at a time
+    return keyP
+      .then(function(key) { return subtle.decrypt({name: "AES-GCM", iv: b(env.iv)}, key, b(env.ct)); })
+      .then(function(plain) { return JSON.parse(new TextDecoder().decode(plain)).files || {}; },
+            function() { GH.keys = {}; throw new Error("Wrong passphrase, or the data is damaged"); });
+  },
+
+  // The decrypted bundle; re-checks the Gist at most every 15 s
+  load: function(force) {
+    if (!force && GH.bundle && Date.now() - GH.checkedAt < 15000) return Promise.resolve(GH.bundle);
+    if (GH.pending) return GH.pending;
+    GH.pending = GH.waitConnected()
+      .then(function() { return GH.getGist(); })
+      .then(function(g) {
+        GH.checkedAt = Date.now();
+        if (GH.bundle && g.updated === GH.version) return GH.bundle;
+        return GH.decrypt(g.text, GH.pass()).then(function(files) {
+          GH.bundle = files; GH.version = g.updated; return files;
+        });
+      })
+      .then(function(files) { GH.pending = null; GH.setChip(true); return files; },
+            function(err) { GH.pending = null; GH.setChip(false, err.message); throw err; });
+    return GH.pending;
+  },
+
+  // /api/file?name=X uses trigger.py's names: "watchlist.csv", "logs/…",
+  // or a bare log name like "performance_log.json"
+  fileKey: function(name) {
+    return (name === "watchlist.csv" || name.indexOf("logs/") === 0) ? name : "logs/" + name;
+  },
+
+  respond: function(status, body, type) {
+    return new Response(body, {status: status, headers: {"Content-Type": type || "application/json"}});
+  },
+
+  handle: function(u, opts) {
+    var method = ((opts && opts.method) || "GET").toUpperCase();
+    if (method === "GET" && (u.pathname === "/latest.json" || u.pathname === "/api/file")) {
+      var key = u.pathname === "/latest.json" ? "logs/latest.json" : GH.fileKey(u.searchParams.get("name") || "");
+      return GH.load(u.pathname === "/latest.json").then(function(files) {
+        if (!(key in files)) return GH.respond(404, JSON.stringify({error: key + " not in the Gist"}));
+        return GH.respond(200, files[key], /\.csv$/.test(key) ? "text/csv" : "application/json");
+      }, function(err) { return GH.respond(502, JSON.stringify({error: err.message})); });
+    }
+    // Run buttons and edits arrive in later steps; until then say so plainly
+    showToast("☁️ On GitHub this dashboard is view-only for now — start runs from the GitHub Actions tab");
+    return Promise.resolve(GH.respond(501, JSON.stringify({error: "Not available in GitHub mode yet"})));
+  },
+
+  // Connect form, shown until a Gist ID, token and passphrase are set
+  waitConnected: function() {
+    if (GH.connected()) return Promise.resolve();
+    if (!GH.connectP) GH.connectP = new Promise(function(resolve) { GH.showConnect(resolve); });
+    return GH.connectP;
+  },
+
+  showConnect: function(onDone, message) {
+    var old = document.getElementById("gh-connect"); if (old) old.remove();
+    var c = GH.cfg();
+    var box = document.createElement("div");
+    box.id = "gh-connect";
+    box.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(3,10,18,0.92);display:flex;align-items:center;justify-content:center;padding:16px";
+    var field = "width:100%;box-sizing:border-box;margin:4px 0 12px;padding:10px;border-radius:8px;border:1px solid rgba(14,165,201,0.3);background:#0A1520;color:#D8EEFF;font-size:14px";
+    box.innerHTML =
+      '<div style="max-width:420px;width:100%;background:#071321;border:1px solid rgba(14,165,201,0.25);border-radius:14px;padding:20px;color:#D8EEFF;font-size:13px">' +
+        '<div style="font-size:15px;font-weight:700;margin-bottom:6px">☁️ Connect to your Market Agent data</div>' +
+        '<div style="color:#8BA3BC;font-size:11px;margin-bottom:14px">Kept in this browser only. The passphrase decrypts your data here; it is never sent anywhere.</div>' +
+        (message ? '<div style="color:#FF4D6A;font-size:12px;margin-bottom:10px">' + escHtml(message) + '</div>' : '') +
+        '<label>Gist ID</label><input id="gh-gist" style="' + field + '" autocomplete="off" value="' + escHtml(c.gistId || "") + '">' +
+        '<label>Gist token (classic, gist scope)</label><input id="gh-token" type="password" style="' + field + '" autocomplete="off" value="' + escHtml(c.gistToken || "") + '">' +
+        '<label>Passphrase</label><input id="gh-pass" type="password" style="' + field + '" autocomplete="off">' +
+        '<label style="display:flex;gap:8px;align-items:center;margin-bottom:14px;color:#8BA3BC"><input id="gh-remember" type="checkbox"' + (c.remember ? " checked" : "") + '> Remember the passphrase on this device</label>' +
+        '<button id="gh-go" style="width:100%;padding:12px;border:0;border-radius:10px;background:linear-gradient(135deg,#0B4F6C,#0EA5C9);color:#fff;font-weight:700;font-size:14px">Connect</button>' +
+      '</div>';
+    document.body.appendChild(box);
+    document.getElementById("gh-go").onclick = function() {
+      var gistId = document.getElementById("gh-gist").value.trim();
+      var token = document.getElementById("gh-token").value.trim();
+      var pass = document.getElementById("gh-pass").value;
+      var remember = document.getElementById("gh-remember").checked;
+      if (!gistId || !token || !pass) { GH.showConnect(onDone, "Fill in all three fields"); return; }
+      try {
+        localStorage.setItem(GH.CFG_KEY, JSON.stringify({gistId: gistId, gistToken: token, remember: remember}));
+        localStorage.removeItem(GH.PASS_KEY); sessionStorage.removeItem(GH.PASS_KEY);
+        (remember ? localStorage : sessionStorage).setItem(GH.PASS_KEY, pass);
+      } catch(e) {}
+      GH.bundle = null; GH.version = null; GH.keys = {};
+      document.getElementById("gh-go").textContent = "Checking…";
+      GH.getGist().then(function(g) { return GH.decrypt(g.text, pass); })
+        .then(function() { box.remove(); onDone(); },
+              function(err) { GH.showConnect(onDone, err.message); });
+    };
+  },
+
+  disconnect: function() {
+    try { localStorage.removeItem(GH.CFG_KEY); localStorage.removeItem(GH.PASS_KEY); sessionStorage.removeItem(GH.PASS_KEY); } catch(e) {}
+    location.reload();
+  },
+
+  // Header label: GITHUB (green) when the Gist read worked
+  setChip: function(ok, why) {
+    var lbl = document.getElementById("live-lbl"), dot = document.getElementById("live-dot");
+    if (lbl) { lbl.textContent = ok ? "GITHUB" : "GITHUB ⚠"; lbl.title = ok ? "Data from your encrypted Gist — tap to reconnect" : why; lbl.style.cursor = "pointer"; }
+    if (dot) dot.style.background = ok ? "#00C896" : "#FF4D6A";
+  }
+};
+
+if (GH_MODE) {
+  GH.origFetch = window.fetch.bind(window);
+  window.fetch = function(url, opts) {
+    var u = new URL(url, location.href);
+    if (u.origin === location.origin && (u.pathname === "/latest.json" || u.pathname.indexOf("/api/") === 0)) {
+      return GH.handle(u, opts);
+    }
+    return GH.origFetch(url, opts);
+  };
+  window.addEventListener("load", function() {
+    var lbl = document.getElementById("live-lbl");
+    if (lbl) lbl.onclick = function() {
+      if (confirm("Reconnect to your Gist? (Cancel keeps the current connection)")) GH.disconnect();
+    };
+  });
+}
+
 // ── SERVER CONFIG ─────────────────────────────────────────────
 // Normally served by local/local_server.py (http://localhost:8000), so every
 // request goes to the page's own origin. Opened as a file, it talks to that
@@ -868,6 +1057,7 @@ document.querySelectorAll(".srv-url").forEach(function(el){ el.textContent = SER
 // localStorage. Copy it in Terminal with: pbcopy < ~/market-agent/.trigger_token
 var TOKEN_STORAGE_KEY = "ma_trigger_token";
 function loadTriggerToken() {
+  if (GH_MODE) return "";   // no laptop server on GitHub
   var t = "";
   try { t = localStorage.getItem(TOKEN_STORAGE_KEY) || ""; } catch(e) {}
   if (!t) {
@@ -1765,7 +1955,7 @@ function setHeader(data) {
   var ts  = toOmanTime(raw) || raw;
   document.getElementById("hdr-sub").textContent = "Updated " + ts;
   document.getElementById("live-dot").style.background = "#00C896";
-  document.getElementById("live-lbl").textContent = "LIVE";
+  document.getElementById("live-lbl").textContent = GH_MODE ? "GITHUB" : "LIVE";
 }
 
 // ── NYSE MARKET STATUS (holiday-aware, DST-aware) ──────────────
