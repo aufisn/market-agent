@@ -1,0 +1,4 @@
+ticker,name,market,list_type,quantity,buy_price,target,stop_loss,alert_above,alert_below
+CASH,Available Cash,US,cash,10000,0,0,0,0,0
+AAPL,Apple Inc,US,holding,10,190.00,230.00,0,0,0
+MSFT,Microsoft Corp,US,interested,0,0,0,0,0,0

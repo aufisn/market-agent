@@ -1,0 +1,329 @@
+{
+  "version": "3.0",
+  "profile": "Balanced Growth",
+  "horizon": "1-3 years",
+  "risk_tolerance": "Moderate",
+  "position_sizing": {
+    "max_single_stock_pct": 10,
+    "max_existing_holding_pct": 20,
+    "max_sector_pct": 30,
+    "min_cash_pct": 15,
+    "max_positions": 12,
+    "min_positions": 6,
+    "note": "10% max for new positions, 20% max for existing proven winners. All weights calculated against total capital including cash. min_order_usd: smallest new buy worth placing (a $25 commission on a tiny order is a large % cost). risk_per_trade_pct (L4): new buys are sized so a stop-out loses about this % of total capital, scaled by conviction (High 1.0, Medium 0.75, Low 0.5; x0.75 for a strong bear case), never above max_single_stock_pct.",
+    "min_order_usd": 2000,
+    "risk_per_trade_pct": 1.0
+  },
+  "position_actions": {
+    "top_up_target_pct": 10,
+    "top_up_cooldown_days": 10,
+    "note": "The action on a holding is set by these rules, in priority order: SELL (the hard exit or the stop is hit, or Claude says SELL and the thesis tracker rates the thesis BROKEN), TRIM (weight above max_existing_holding_pct, or the stop tracker advises partial profit; amount brings it back to the cap; a Claude SELL on an overweight position with the thesis intact becomes TRIM), WATCH for any other Claude SELL or a broken thesis (review, not a rule exit), TOP-UP (in profit, below top_up_target_pct, Claude's view HOLD or better with Medium/High confidence, cash stays above the floor, RSI within entry_rules.rsi_max, no earnings within the Gate 5 window, sector room, no trade in the stock for top_up_cooldown_days trading days; amount capped by the risk budget and min_order_usd), otherwise HOLD / WATCH. Claude's own label is kept as claude_signal."
+  },
+  "cash_deployment": {
+    "floor_pct": 15,
+    "normal_pct": 20,
+    "excess_pct": 30,
+    "rules": [
+      "Cash below 15% — no new buys under any circumstances, protect the floor",
+      "Cash 15-20% — buy only if all 6 quality gates pass, single position only",
+      "Cash 20-30% — normal operation, deploy when qualifying picks found",
+      "Cash 30-40% — agent should actively seek qualifying picks, flag if none found",
+      "Cash above 40% — CAPITAL INEFFICIENCY alert, prioritise deployment into qualifying picks"
+    ]
+  },
+  "candidate_universe": {
+    "total_size": 52,
+    "note": "Normally the candidate list is data/universe_master.json (300 stocks, rebuilt by Refresh Stock List). These sector slots are only used if that file is missing, when Claude proposes a one-off list.",
+    "sectors": {
+      "Technology": {
+        "slots": 7,
+        "bias": "profitable mega/large-cap, positive FCF, not purely speculative"
+      },
+      "Healthcare": {
+        "slots": 7,
+        "bias": "diversified across pharma, biotech, devices, insurers"
+      },
+      "Financials": {
+        "slots": 6,
+        "bias": "banks, asset managers, payment networks, insurance"
+      },
+      "Consumer Staples": {
+        "slots": 6,
+        "bias": "defensive, dividend-paying, global brands"
+      },
+      "Energy": {
+        "slots": 6,
+        "bias": "diversified across oil, gas, pipelines, renewables"
+      },
+      "Industrials": {
+        "slots": 5,
+        "bias": "defence, aerospace, logistics, infrastructure"
+      },
+      "Consumer Discretionary": {
+        "slots": 5,
+        "bias": "retail, restaurants, travel, auto"
+      },
+      "Utilities": {
+        "slots": 4,
+        "bias": "regulated utilities, clean energy, stable dividends"
+      },
+      "Real Estate": {
+        "slots": 3,
+        "bias": "diversified REITs, infrastructure, data centres"
+      },
+      "ETFs & Commodities": {
+        "slots": 3,
+        "bias": "broad market ETFs, gold, sector ETFs for diversification"
+      }
+    },
+    "pre_filter": {
+      "max_beta": 2.0,
+      "min_revenue_growth": -5,
+      "note": "Applied in Python before Claude sees a candidate: drops beta above max_beta and revenue shrinking faster than min_revenue_growth. RSI is checked later, at Gate 5."
+    }
+  },
+  "stop_loss": {
+    "note": "Contextual stop replaces fixed %. stop_tracker.py owns all stop logic.",
+    "hard_exit_pct": -15,
+    "hard_rule": "Always exit immediately at -15% cumulative loss — no exceptions, no filters applied",
+    "contextual_stop": {
+      "enabled": true,
+      "description": "Stop clock only starts when stock decline is stock-specific, not market/sector driven",
+      "gates": {
+        "gate_0a_single_day": {
+          "description": "Single-day loss exceeds 1x ATR — flag for monitoring",
+          "threshold_atr_multiplier": 1.0,
+          "action": "start_monitoring"
+        },
+        "gate_0b_cumulative_drift": {
+          "description": "10-day cumulative drift from entry price",
+          "window_days": 10,
+          "thresholds": {
+            "early_warning_pct": -5,
+            "level_1_pct": -8,
+            "level_2_pct": -12,
+            "hard_exit_pct": -15
+          }
+        }
+      },
+      "context_filters": {
+        "filter_1_market": {
+          "ticker": "SPY",
+          "description": "If SPY is also down > 1% today, stock decline may be market-driven — suppress stop clock",
+          "spy_down_threshold_pct": -1.0
+        },
+        "filter_2_sector": {
+          "description": "If sector ETF is also down > 1% today, decline may be sector rotation — suppress stop clock",
+          "sector_down_threshold_pct": -1.0,
+          "sector_etf_map": {
+            "Technology": "XLK",
+            "Healthcare": "XLV",
+            "Financials": "XLF",
+            "Consumer Staples": "XLP",
+            "Energy": "XLE",
+            "Industrials": "XLI",
+            "Consumer Discretionary": "XLY",
+            "Utilities": "XLU",
+            "Real Estate": "XLRE",
+            "Commodities": "GLD",
+            "Communications": "XLC",
+            "Index": "SPY"
+          }
+        }
+      },
+      "stop_clock": {
+        "description": "Clock starts counting days once threshold is breached AND context filters confirm stock-specific decline",
+        "level_1": {
+          "threshold_pct": -8,
+          "days_allowed": 5,
+          "action": "ALERT — position under pressure, review thesis"
+        },
+        "level_2": {
+          "threshold_pct": -12,
+          "days_allowed": 3,
+          "action": "STRONG ALERT — exit strongly recommended"
+        },
+        "hard_exit": {
+          "threshold_pct": -15,
+          "days_allowed": 0,
+          "action": "EXIT IMMEDIATELY — no clock, no filters"
+        }
+      },
+      "trailing_stop": {
+        "enabled": true,
+        "description": "Protect profit without selling on normal noise",
+        "activate_at_pct": 20,
+        "min_trail_pct": 15,
+        "atr_multiple": 3,
+        "note": "Trail stop = highest price since activation minus the wider of min_trail_pct and atr_multiple x the 14-day ATR%. Simulator ledgers start trailing at activate_at_pct; real holdings when the target is confirmed. Tested 2026-11-02, rules review section 10 (was 8% from +10%)."
+      },
+      "gain_clock": {
+        "description": "Mirror of stop clock for profit target confirmation",
+        "target_confirmation_days": 3,
+        "note": "If price reaches target but reverses, gain clock tracks days above target. After 3 days, take profit or activate trailing stop."
+      }
+    }
+  },
+  "entry_rules": {
+    "rsi_max": 60,
+    "rsi_ideal": 35,
+    "fear_greed_max": 65,
+    "fear_greed_ideal": 35,
+    "require_thesis": true,
+    "require_target": true,
+    "require_stop": true
+  },
+  "exit_rules": {
+    "take_profit_at_target": true,
+    "exit_at_stop_loss": true,
+    "rsi_overbought_exit": 75,
+    "trim_existing_at_pct": 20,
+    "trim_new_at_pct": 10
+  },
+  "priority_exit_rules": {
+    "description": "Universal rules that trigger priority exit — no stock names",
+    "rules": [
+      "Stop loss breached by more than 2% — exit immediately, no exceptions",
+      "Position has lost more than 15% — exit immediately regardless of market context",
+      "Position weight exceeds 25% of total capital — trim to below 20% immediately",
+      "Holding period exceeds 3 years with no progress toward target — exit and redeploy",
+      "Fundamental thesis broken — revenue declining 2+ consecutive quarters, guidance cut"
+    ]
+  },
+  "trim_rules": {
+    "description": "Universal rules that trigger a trim — no stock names",
+    "rules": [
+      "Any existing holding exceeds 20% of total capital — trim to 20%",
+      "Any new position exceeds 10% of total capital — trim to 10%",
+      "Any sector exceeds 30% of total capital — trim highest-weight stock in that sector",
+      "RSI above 75 on any holding — consider trimming 25-50% of position"
+    ]
+  },
+  "target_allocation": {
+    "Technology": {
+      "min": 15,
+      "max": 30
+    },
+    "Energy": {
+      "min": 10,
+      "max": 20
+    },
+    "Healthcare": {
+      "min": 10,
+      "max": 15
+    },
+    "Financials": {
+      "min": 5,
+      "max": 15
+    },
+    "Commodities": {
+      "min": 5,
+      "max": 10
+    },
+    "Consumer Discretionary": {
+      "min": 0,
+      "max": 15
+    },
+    "Other": {
+      "min": 0,
+      "max": 10
+    }
+  },
+  "rebalancing": {
+    "existing_holdings_max_pct": 20,
+    "new_positions_max_pct": 10,
+    "target_positions": 8,
+    "note": "Rebalancing triggered by position weight rules — never by stock name."
+  },
+  "red_flags": [
+    "Single new position > 10% of total capital (including cash)",
+    "Single existing holding > 20% of total capital (including cash)",
+    "Single sector > 30% of total capital (including cash)",
+    "Cash below 15% of total capital — hard floor breached",
+    "Any position below its contextual stop threshold AND stop clock expired",
+    "Any position below -15% cumulative loss — hard exit required immediately",
+    "RSI > 75 on any holding",
+    "Fewer than 6 total positions",
+    "Stop tracker early warning fired — position drifting toward stop"
+  ],
+  "green_flags": [
+    "Fear & Greed below 35 — buying opportunity",
+    "RSI below 35 on quality stock — potential entry",
+    "Price at or near 200-day MA support",
+    "Cash 15-20% — at floor, fully deployed and healthy",
+    "Cash above 30% — ready to deploy into qualifying picks",
+    "Portfolio well diversified across 6+ sectors",
+    "All positions within weight limits — balanced and ready to add",
+    "Stop tracker: no positions in warning zone — all holdings healthy"
+  ],
+  "pick_quality_gates": {
+    "gate1_strategy_score": {
+      "min_score": 81,
+      "description": "Overall Claude-assessed fit score for the pick (0-100). Must meet or exceed this to qualify. Was hardcoded at 90; relaxed to 81 given how few candidates were clearing 90 in practice."
+    },
+    "gate2_risk_level": {
+      "acceptable_levels": [
+        "Low",
+        "Medium"
+      ],
+      "description": "Claude-assessed risk level for the pick. Must be one of these to qualify. Was hardcoded to accept only Low; relaxed to also accept Medium."
+    },
+    "gate3_confidence": {
+      "acceptable_levels": [
+        "Medium",
+        "High"
+      ],
+      "description": "Claude confidence in the pick thesis. Must be one of these to qualify. Was hardcoded to accept only High; relaxed to also accept Medium."
+    },
+    "gate4_sector_exposure": {
+      "buffer_pct": 5,
+      "description": "Pick is rejected if current sector exposure is within this many percentage points of position_sizing.max_sector_pct. Unchanged from the original hardcoded value."
+    },
+    "gate5_entry_conditions": {
+      "earnings_risk_days": 7,
+      "description": "Pick is rejected if next earnings report is due within this many days. RSI and Fear & Greed thresholds remain under entry_rules. Unchanged from the original hardcoded value."
+    },
+    "gate7_headroom": {
+      "hard_headroom_pct": 15.0,
+      "soft_headroom_pct": 10.0,
+      "soft_min_upside_pct": 20.0,
+      "description": "Pick must be at least hard_headroom_pct below its 52-week high, OR at least soft_headroom_pct below AND have at least soft_min_upside_pct upside to target. Unchanged from the original hardcoded values."
+    }
+  },
+  "trading_costs": {
+    "commission_type": "fixed",
+    "commission_fixed_usd": 25,
+    "commission_pct": 0,
+    "note": "Applied to every buy and sell across all simulator ledgers, matching real-world brokerage commission. Set commission_type to percentage and use commission_pct instead if your broker charges a percentage-of-trade-value fee."
+  },
+  "api_budget": {
+    "per_run_usd": 3.0,
+    "monthly_usd": 50.0,
+    "note": "Claude spend caps. A call is refused (and the run falls back or fails with an alert) if its worst-case cost would exceed either cap. Spend is logged to logs/api_usage.jsonl."
+  },
+  "regime_exposure": {
+    "max_exposure_pct": {
+      "BULL_TREND": 85,
+      "CHOPPY": 80,
+      "BEAR_TREND": 75,
+      "CRISIS": 60
+    },
+    "vix_elevated": 25,
+    "vix_elevated_cut": 5,
+    "vix_high": 30,
+    "vix_high_cut": 10,
+    "breadth_weak_pct": -2.0,
+    "breadth_weak_cut": 5,
+    "min_exposure_pct": 50,
+    "circuit_breaker_drawdown_pct": 10,
+    "severe_drawdown_pct": 20,
+    "allow_buying_drawdowns": false,
+    "note": "L3: most of total capital allowed in stocks, by regime, cut when VIX is high or breadth narrows. 100 minus this is the cash floor (never below min_cash_pct). When SPY is circuit_breaker_drawdown_pct below its 52-week high, new buys stop unless allow_buying_drawdowns is true."
+  },
+  "outcome_grading": {
+    "band_pct": 3.0,
+    "benchmark": "SPY",
+    "claude_review": false,
+    "note": "L2: picks and holdings are graded at 30/60/90 days by rules only — target or stop reached first, otherwise return vs the benchmark over the same days (inside ±band_pct = partially correct). claude_review true adds a Claude second opinion (costs credit), stored beside the rule grade."
+  }
+}

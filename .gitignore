@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+.trigger_token
+
+# Runtime data (lives in ~/market-agent or on the server)
+watchlist.csv
+logs/
+data/
+.source_dir
+
+# Local
+venv/
+__pycache__/
+.DS_Store
+Old files/
+backups/
+
+# Review reports and test harness mention real holdings — keep off GitHub
+review/
+*.tgz
+*.zip
