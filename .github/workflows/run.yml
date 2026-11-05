@@ -1,0 +1,76 @@
+# Market Agent V4.5 — full pipeline on GitHub's computers.
+# Started by hand (the dashboard's Run button, or the Actions tab → Run
+# workflow); there is no schedule.
+#
+# This repo is public, so its Actions logs are public too. The pipeline's
+# own output (holdings, P&L, picks) is written to logs/runs/ inside the
+# encrypted state, never to this log; only step names and pass/fail show here.
+name: Run Market Agent
+
+on:
+  workflow_dispatch:
+
+# One run at a time: two runs would overwrite each other's state
+concurrency:
+  group: market-agent-state
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: Asia/Muscat
+      MA_BASE_DIR: ${{ github.workspace }}
+      MA_PASSPHRASE: ${{ secrets.MA_PASSPHRASE }}
+      MA_GIST_ID: ${{ secrets.MA_GIST_ID }}
+      MA_GIST_TOKEN: ${{ secrets.MA_GIST_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            ci/constraints.txt
+            ci/requirements-ci.txt
+
+      - name: Install packages
+        run: pip install -q -r requirements.txt -r ci/requirements-ci.txt -c ci/constraints.txt
+
+      - name: Restore state from the Gist
+        id: pull
+        run: python ci/state_store.py pull
+
+      - name: Run the pipeline (output kept private)
+        id: pipeline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p logs/runs
+          OUT="logs/runs/agent_$(date -u +%Y%m%dT%H%M%S).txt"
+          set +e
+          bash run_agent.sh > "$OUT" 2>&1
+          CODE=$?
+          set -e
+          python - <<'PY'
+          import json
+          try:
+              s = json.load(open("logs/agent_run_status.json"))
+              print(f"Pipeline status: {s.get('status')} — step {s.get('step')}/{s.get('total_steps')}: {s.get('step_label')}")
+          except Exception:
+              print("Pipeline status: unknown (no status file)")
+          PY
+          echo "Exit code: $CODE (full output is in the encrypted state, $OUT)"
+          exit $CODE
+
+      - name: Save state to the Gist
+        if: always() && steps.pull.outcome == 'success'
+        run: python ci/state_store.py push
