@@ -1361,8 +1361,15 @@ var GH = {
     };
   },
 
+  // Forgets the Gist token and passphrase; keeps the Gist ID (prefilled in
+  // the form) and the Run token, so a Gist-token change needs only the new token
   disconnect: function() {
-    try { localStorage.removeItem(GH.CFG_KEY); localStorage.removeItem(GH.PASS_KEY); sessionStorage.removeItem(GH.PASS_KEY); } catch(e) {}
+    var c = GH.cfg(), keep = {};
+    ["gistId", "runToken", "repo", "remember"].forEach(function(k) { if (c[k] !== undefined) keep[k] = c[k]; });
+    try {
+      localStorage.setItem(GH.CFG_KEY, JSON.stringify(keep));
+      localStorage.removeItem(GH.PASS_KEY); sessionStorage.removeItem(GH.PASS_KEY);
+    } catch(e) {}
     location.reload();
   },
 
