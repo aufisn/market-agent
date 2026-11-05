@@ -42,6 +42,25 @@ _trade_history_lock = threading.Lock()  # atomic append — several traders/tabs
 # Readable via GET /file?name=X, but deliberately NOT in ALLOWED_FILES below —
 # writes must go through /record-trade so every entry is validated and
 # appended atomically, never overwritten wholesale from the client.
+def local_backup():
+    """watchlist.csv, logs/ and data/ as a .tar.gz — the same contents and
+    exclusions as local/backup_local.sh and the GitHub state."""
+    import io, re, tarfile
+    skip = re.compile(r"(^|/)(run\.lock|__pycache__)(/|$)|\.log$|\.tmp$|\.DS_Store$")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for top in ("watchlist.csv", "logs", "data"):
+            full = os.path.join(BASE_DIR, top)
+            if os.path.isfile(full):
+                tar.add(full, arcname=top)
+            for root, _, names in os.walk(full):
+                for n in names:
+                    rel = os.path.relpath(os.path.join(root, n), BASE_DIR).replace(os.sep, "/")
+                    if not skip.search(rel):
+                        tar.add(os.path.join(BASE_DIR, rel), arcname=rel, recursive=False)
+    return buf.getvalue()
+
+
 READ_ONLY_FILES = {
     "logs/trade_history.json":   TRADE_HISTORY_PATH,
     "logs/simulator_state.json": os.path.join(BASE_DIR, "logs", "simulator_state.json"),
@@ -125,6 +144,20 @@ class TriggerHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         qs   = self.path.split("?")[1] if "?" in self.path else ""
         params = dict(p.split("=") for p in qs.split("&") if "=" in p)
+
+        # ── /backup — the laptop's data as a plain .tar.gz (Download backup) ──
+        if path == "/backup":
+            if not self._auth(allow_read=True):
+                self.send_response(401); self.end_headers()
+                self.wfile.write(b"Unauthorized"); return
+            content = local_backup()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", len(content))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(content)
+            return
 
         if path != "/file":
             self.send_response(404); self.end_headers(); return

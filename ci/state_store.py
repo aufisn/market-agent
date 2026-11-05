@@ -19,15 +19,25 @@
 #   state_store.py push                save state + dashboard bundle
 #   state_store.py seed --from DIR     first upload from the laptop install
 #   state_store.py open-input VAR OUT  decrypt an encrypted workflow input
+#   state_store.py backup --to DIR     save the Gist's data as a plain dated
+#                                      market-agent-backup-YYYY-MM-DD.tar.gz
+#   state_store.py restore FILE        load a backup into the Gist (saves the
+#                                      current data as a backup first)
+# Backups are the same plain format as local/backup_local.sh, so a GitHub
+# backup restores on the laptop and a laptop backup restores to GitHub.
 #
 # Environment: MA_PASSPHRASE, MA_GIST_ID, MA_GIST_TOKEN (classic token,
-# gist scope). seed prompts for the passphrase and can use `gh auth token`.
+# gist scope). On the laptop the Gist ID is read from ~/market-agent/.gist_id
+# when MA_GIST_ID is unset, so it never has to appear in a command or the repo. seed prompts for the passphrase and can use `gh auth token`.
 # MA_STORE_DIR=<folder> stores the two files in a local folder instead of
 # the Gist (for testing).
 # ============================================================
 
 import argparse
 import base64
+import datetime
+import shutil
+import tempfile
 import getpass
 import io
 import json
@@ -125,17 +135,58 @@ def pack(app_dir):
     return buf.getvalue()
 
 
+def _checked_members(tar):
+    """Every entry must be a file or folder under watchlist.csv, logs/ or data/."""
+    members = []
+    for m in tar.getmembers():
+        name = m.name[2:] if m.name.startswith("./") else m.name
+        if name in ("", ".") or name.split("/")[-1].startswith("._"):
+            continue                     # macOS tar's hidden metadata files
+        if (not (m.isfile() or m.isdir()) or name.startswith("/") or ".." in name.split("/")
+                or name.split("/")[0] not in STATE_PATHS):
+            raise ValueError(f"unexpected path in state archive: {m.name}")
+        members.append(m)
+    return members
+
+
 def unpack(blob, app_dir):
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
-        members = []
-        for m in tar.getmembers():
-            name = m.name
-            if (not (m.isfile() or m.isdir()) or name.startswith("/") or ".." in name.split("/")
-                    or name.split("/")[0] not in STATE_PATHS):
-                raise ValueError(f"unexpected path in state archive: {name}")
-            members.append(m)
+        members = _checked_members(tar)
         tar.extractall(app_dir, members=members, filter="data")
     return len(members)
+
+
+def check_backup(blob):
+    """(file count) for a valid backup, else ValueError."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+            members = _checked_members(tar)
+    except tarfile.TarError:
+        raise ValueError("not a Market Agent backup (.tar.gz)") from None
+    names = {m.name[2:] if m.name.startswith("./") else m.name for m in members}
+    if "watchlist.csv" not in names:
+        raise ValueError("not a Market Agent backup: no watchlist.csv inside")
+    return sum(1 for m in members if m.isfile())
+
+
+def backup_path(folder, suffix=""):
+    """<folder>/market-agent-backup-YYYY-MM-DD[suffix].tar.gz, with the time
+    added when that name is taken (several backups a day)."""
+    now = datetime.datetime.now()
+    path = os.path.join(folder, f"market-agent-backup-{now:%Y-%m-%d}{suffix}.tar.gz")
+    if os.path.exists(path):
+        path = os.path.join(folder, f"market-agent-backup-{now:%Y-%m-%d_%H%M%S}{suffix}.tar.gz")
+    return path
+
+
+def write_backup(blob, folder, suffix=""):
+    folder = os.path.abspath(os.path.expanduser(folder))
+    os.makedirs(folder, exist_ok=True)
+    path = backup_path(folder, suffix)
+    with open(path, "wb") as f:
+        f.write(blob)
+    os.chmod(path, 0o600)          # plain data: readable by you only
+    return path
 
 
 def dashboard_bundle(app_dir):
@@ -149,9 +200,14 @@ def dashboard_bundle(app_dir):
 
 
 # ── STORAGE (Gist, or a local folder for tests) ───────────────
+GIST_ID_FILE = os.path.expanduser("~/market-agent/.gist_id")   # laptop only, never in the repo
+
+
 class Store:
     def __init__(self, gist_id=None, token=None):
         self.dir = os.getenv("MA_STORE_DIR")
+        if not gist_id and os.path.exists(GIST_ID_FILE):
+            gist_id = open(GIST_ID_FILE).read().strip()
         self.gist_id, self.token = gist_id, token
         if not self.dir and not (gist_id and token):
             sys.exit("✗ MA_GIST_ID and MA_GIST_TOKEN are not set")
@@ -347,6 +403,47 @@ def cmd_open_input(args):
         f.write(value)
 
 
+def cmd_backup(args):
+    store = Store(os.getenv("MA_GIST_ID"), os.getenv("MA_GIST_TOKEN") or _gh_token())
+    text = store.read(STATE_FILE)
+    if text is None:
+        sys.exit("✗ The Gist holds no data yet")
+    blob = decrypt(text, _passphrase(prompt=True, confirm=False))
+    n = check_backup(blob)
+    print(f"✓ Backup saved: {write_backup(blob, args.to)} ({n} files, plain — keep it private)")
+
+
+def cmd_restore(args):
+    path = os.path.abspath(os.path.expanduser(args.file))
+    blob = open(path, "rb").read()
+    n = check_backup(blob)
+    store = Store(os.getenv("MA_GIST_ID"), os.getenv("MA_GIST_TOKEN") or _gh_token())
+    current = store.read(STATE_FILE)
+    # With data already in the Gist, decrypting it proves the passphrase is
+    # right before anything is replaced; with none, type it twice
+    passphrase = _passphrase(prompt=True, confirm=current is None)
+    keep = args.keep_dir or os.path.dirname(path)
+    if current is not None:
+        before = write_backup(decrypt(current, passphrase), keep, "-before-restore")
+        print(f"✓ Current Gist data saved first: {before}")
+    if not args.yes:
+        answer = input(f"Replace the Gist's data with {os.path.basename(path)} ({n} files)? Type RESTORE: ")
+        if answer.strip() != "RESTORE":
+            sys.exit("✗ Not restored")
+    pending = len(read_inbox(store, passphrase)) if current is not None else 0
+    tmp = tempfile.mkdtemp(prefix="ma-restore-")
+    try:
+        unpack(blob, tmp)
+        save(tmp, store, passphrase)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # Phone edits made against the old data would be applied on top of the
+    # restored data on the next run, so they are dropped
+    store.write({INBOX_FILE: encrypt(json.dumps({"ops": []}).encode(), passphrase)})
+    print(f"✓ Restored {n} files to the Gist from {path}"
+          + (f" ({pending} pending phone edit(s) discarded)" if pending else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Encrypted Market Agent state in a secret Gist")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -362,9 +459,16 @@ def main():
     o = sub.add_parser("open-input")
     o.add_argument("var", help="environment variable holding the encrypted input")
     o.add_argument("out", help="file to write the plain value to")
+    b = sub.add_parser("backup")
+    b.add_argument("--to", required=True, help="folder to save the dated backup in")
+    r = sub.add_parser("restore")
+    r.add_argument("file", help="a market-agent-backup-*.tar.gz")
+    r.add_argument("--keep-dir", help="where to save the current data first (default: next to FILE)")
+    r.add_argument("--yes", action="store_true", help="don't ask to confirm")
     args = ap.parse_args()
     try:
-        {"pull": cmd_pull, "push": cmd_push, "seed": cmd_seed, "open-input": cmd_open_input}[args.cmd](args)
+        {"pull": cmd_pull, "push": cmd_push, "seed": cmd_seed, "open-input": cmd_open_input,
+         "backup": cmd_backup, "restore": cmd_restore}[args.cmd](args)
     except ValueError as e:
         sys.exit(f"✗ {e}")
 

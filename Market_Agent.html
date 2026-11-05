@@ -804,6 +804,21 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     <div id="universe-refresh-status" style="font-size:11px;color:#BD6FFF;text-align:center;min-height:14px;margin-top:8px"></div>
   </div>
 
+  <div class="sec-lbl">💾 Backup</div>
+  <div style="background:rgba(10,21,32,0.7);border:1px solid rgba(255,255,255,0.05);border-radius:10px;padding:12px 16px;margin-bottom:10px">
+    <div style="font-size:11px;color:#8BA3BC;line-height:1.6;margin-bottom:10px">
+      Saves all your data (watchlist, trades, simulator, logs) as one dated file,
+      <code>market-agent-backup-YYYY-MM-DD.tar.gz</code>. It is <b>not encrypted</b>: keep it private.
+      Restore it on the laptop with <code>local/restore_local.sh</code> (no GitHub needed), or back
+      to GitHub with <code>ci/state_store.py restore</code>.
+    </div>
+    <button id="backup-btn" onclick="downloadBackup()"
+      style="width:100%;padding:12px 6px;border:none;border-radius:10px;background:linear-gradient(135deg,#0B4F6C,#0EA5C9);color:#E8F8FF;font-size:13px;font-weight:700;cursor:pointer">
+      💾 Download backup
+    </button>
+    <div id="backup-status" style="font-size:11px;color:#8BA3BC;text-align:center;min-height:14px;margin-top:8px"></div>
+  </div>
+
   <div class="sec-lbl">⏰ US Market Hours (Oman Time)</div>
   <div id="market-status-widget" style="background:rgba(10,21,32,0.7);border:1px solid rgba(255,255,255,0.05);border-radius:10px;padding:12px 16px;margin-bottom:10px"></div>
   <div style="font-size:10px;color:#6690B2;line-height:1.5;margin-bottom:12px;padding:0 4px">
@@ -942,6 +957,28 @@ var GH = {
   },
 
   decryptRaw: function(text, passphrase) {
+    return GH.decryptBytes(text, passphrase).then(function(u8) { return JSON.parse(new TextDecoder().decode(u8)); });
+  },
+
+  // The full state (state.enc) as a plain .tar.gz Blob, for Download backup
+  stateBlob: function() {
+    return GH.waitConnected()
+      .then(function() {
+        return GH.origFetch(GH.API + "/gists/" + encodeURIComponent(GH.cfg().gistId), {
+          cache: "no-store", headers: {"Authorization": "token " + GH.cfg().gistToken, "Accept": "application/vnd.github+json"}
+        });
+      })
+      .then(function(r) { if (!r.ok) throw new Error(GH.apiError(r.status)); return r.json(); })
+      .then(function(g) {
+        var f = (g.files || {})["state.enc"];
+        if (!f) throw new Error("The Gist holds no data yet");
+        return f.truncated ? GH.origFetch(f.raw_url, {cache: "no-store"}).then(function(r) { return r.text(); }) : f.content;
+      })
+      .then(function(text) { return GH.decryptBytes(text, GH.pass()); })
+      .then(function(u8) { return new Blob([u8], {type: "application/gzip"}); });
+  },
+
+  decryptBytes: function(text, passphrase) {
     var env = JSON.parse(text), subtle = window.crypto && window.crypto.subtle;
     if (!subtle) return Promise.reject(new Error("This browser can't decrypt (needs HTTPS)"));
     var b = function(s) { return Uint8Array.from(atob(s), function(ch) { return ch.charCodeAt(0); }); };
@@ -955,7 +992,7 @@ var GH = {
     GH.keys[cacheKey] = keyP;
     return keyP
       .then(function(key) { return subtle.decrypt({name: "AES-GCM", iv: b(env.iv)}, key, b(env.ct)); })
-      .then(function(plain) { return JSON.parse(new TextDecoder().decode(plain)); },
+      .then(function(plain) { return new Uint8Array(plain); },
             function() { GH.keys = {}; throw new Error("Wrong passphrase, or the data is damaged"); });
   },
 
@@ -4754,6 +4791,38 @@ function renderDecisionLog() {
       '<div style="color:#8AB4CE;font-size:10px">'+(r.t.note||"")+'</div></div>';
   });
   return h + '</div>';
+}
+
+// Plain backup of all data, same format as local/backup_local.sh. On
+// GitHub: the Gist's state.enc decrypted here; on the laptop: trigger.py's
+// /backup. Uses the save dialog where the browser has one (choose a folder).
+function downloadBackup() {
+  var st = document.getElementById("backup-status");
+  var d = new Date(), pad = function(n) { return ("0" + n).slice(-2); };
+  var name = "market-agent-backup-" + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + ".tar.gz";
+  st.style.color = "#0EA5C9"; st.textContent = "⏳ Preparing backup…";
+  var blobP = GH_MODE ? GH.stateBlob()
+    : fetch(SERVER_BASE + "/api/backup", {headers: {"X-Token": TRIGGER_TOKEN}, cache: "no-store"})
+        .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.blob(); });
+  blobP.then(function(blob) {
+    if (window.showSaveFilePicker) {
+      return window.showSaveFilePicker({suggestedName: name, types: [{description: "Market Agent backup", accept: {"application/gzip": [".tar.gz", ".gz"]}}]})
+        .then(function(h) { return h.createWritable(); })
+        .then(function(w) { return w.write(blob).then(function() { return w.close(); }); })
+        .then(function() { return name; });
+    }
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    return name;
+  }).then(function(saved) {
+    st.style.color = "#00C896";
+    st.textContent = "✅ Saved " + saved + " — not encrypted, keep it private";
+  }).catch(function(err) {
+    if (err && err.name === "AbortError") { st.textContent = ""; return; }   // save dialog cancelled
+    st.style.color = "#FF4D6A"; st.textContent = "⚠️ Backup failed: " + err.message;
+  });
 }
 
 function resetSimulator() {

@@ -20,3 +20,4 @@ review/
 *.tgz
 *.zip
 .inbox_applied.json
+.gist_id
