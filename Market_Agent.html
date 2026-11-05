@@ -958,16 +958,151 @@ var GH = {
 
   handle: function(u, opts) {
     var method = ((opts && opts.method) || "GET").toUpperCase();
-    if (method === "GET" && (u.pathname === "/latest.json" || u.pathname === "/api/file")) {
-      var key = u.pathname === "/latest.json" ? "logs/latest.json" : GH.fileKey(u.searchParams.get("name") || "");
-      return GH.load(u.pathname === "/latest.json").then(function(files) {
-        if (!(key in files)) return GH.respond(404, JSON.stringify({error: key + " not in the Gist"}));
-        return GH.respond(200, files[key], /\.csv$/.test(key) ? "text/csv" : "application/json");
-      }, function(err) { return GH.respond(502, JSON.stringify({error: err.message})); });
+    if (method === "GET" && u.pathname === "/api/file" && u.searchParams.get("name") === "logs/agent_run_status.json") {
+      return GH.runStatus().then(function(s) {
+        return s ? GH.respond(200, JSON.stringify(s)) : GH.handleFile(u);
+      }, function() { return GH.handleFile(u); });
     }
-    // Run buttons and edits arrive in later steps; until then say so plainly
-    showToast("☁️ On GitHub this dashboard is view-only for now — start runs from the GitHub Actions tab");
+    if (method === "GET" && (u.pathname === "/latest.json" || u.pathname === "/api/file")) return GH.handleFile(u);
+    if (method === "POST" && u.pathname === "/api/run") return GH.startRun();
+    // Other buttons and edits arrive in later steps; until then say so plainly
+    showToast("☁️ On GitHub only Run works so far — edits and the other buttons come next");
     return Promise.resolve(GH.respond(501, JSON.stringify({error: "Not available in GitHub mode yet"})));
+  },
+
+  handleFile: function(u) {
+    var key = u.pathname === "/latest.json" ? "logs/latest.json" : GH.fileKey(u.searchParams.get("name") || "");
+    return GH.load(u.pathname === "/latest.json").then(function(files) {
+      if (!(key in files)) return GH.respond(404, JSON.stringify({error: key + " not in the Gist"}));
+      return GH.respond(200, files[key], /\.csv$/.test(key) ? "text/csv" : "application/json");
+    }, function(err) { return GH.respond(502, JSON.stringify({error: err.message})); });
+  },
+
+  // ── Runs on GitHub Actions (5b) ──
+  // Starting a run needs a fine-grained token limited to this repo with
+  // Actions: read and write. It is asked for once and kept in this browser.
+  WORKFLOW: "run.yml",
+  activeRun: null,
+
+  repo: function() {
+    var c = GH.cfg();
+    if (c.repo) return c.repo;
+    var owner = location.hostname.split(".")[0], name = location.pathname.split("/")[1];
+    return /\.github\.io$/.test(location.hostname) && name ? owner + "/" + name : "aufisn/market-agent";
+  },
+
+  actions: function(path, opts) {
+    opts = opts || {};
+    var c = GH.cfg();
+    return GH.origFetch(GH.API + "/repos/" + GH.repo() + "/actions" + path, {
+      method: opts.method || "GET",
+      cache: "no-store",
+      headers: {"Authorization": "Bearer " + c.runToken, "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"},
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    }).then(function(r) {
+      if (r.status === 401 || r.status === 403 || r.status === 404) {
+        var bad = GH.cfg(); delete bad.runToken;          // ask for a new one next time
+        try { localStorage.setItem(GH.CFG_KEY, JSON.stringify(bad)); } catch(e) {}
+        throw new Error(r.status === 401 ? "GitHub rejected the Run token (wrong or expired) — tap Run to enter a new one"
+                                         : "The Run token can't start runs on " + GH.repo() + " — it needs Actions: read and write");
+      }
+      if (!r.ok) throw new Error("GitHub returned HTTP " + r.status);
+      return r.status === 204 ? null : r.json();
+    });
+  },
+
+  latestRun: function() {
+    return GH.actions("/workflows/" + GH.WORKFLOW + "/runs?per_page=5").then(function(j) {
+      return (j.workflow_runs || [])[0] || null;
+    });
+  },
+
+  startRun: function() {
+    return GH.askRunToken()
+      .then(GH.latestRun)
+      .then(function(run) {
+        if (run && run.status !== "completed") {           // one run at a time, like the laptop's lock
+          GH.activeRun = {id: run.id, since: Date.parse(run.created_at)};
+          return GH.respond(409, JSON.stringify({status: "busy"}));
+        }
+        return GH.actions("/workflows/" + GH.WORKFLOW + "/dispatches", {method: "POST", body: {ref: "main"}})
+          .then(function() {
+            GH.activeRun = {id: null, since: Date.now()};
+            return GH.respond(200, JSON.stringify({status: "started"}));
+          });
+      })
+      .catch(function(err) {
+        showToast("⚠️ " + err.message);
+        return GH.respond(502, JSON.stringify({error: err.message}));
+      });
+  },
+
+  // The live state of the GitHub run as a run-status file (same shape as
+  // write_progress.py), or null when no run is being followed
+  RUN_STAGES: [
+    [/^Set up job|checkout|setup-python|Install packages/i, 1, "Preparing the GitHub runner"],
+    [/^Restore state/i, 2, "Decrypting your data"],
+    [/^Run the pipeline/i, 3, "Running the pipeline (about 5 minutes)"],
+    [/^Save state/i, 4, "Saving encrypted results"]
+  ],
+
+  runStatus: function() {
+    var c = GH.cfg();
+    if (!c.runToken) return Promise.resolve(null);
+    var ar = GH.activeRun;
+    var find = ar && ar.id ? GH.actions("/runs/" + ar.id) : GH.latestRun();
+    return find.then(function(run) {
+      if (!ar) {                                            // page load: follow a run started elsewhere
+        if (!run || run.status === "completed") return null;
+        ar = GH.activeRun = {id: run.id, since: Date.parse(run.created_at)};
+      }
+      if (!run || Date.parse(run.created_at) < ar.since - 60000) {
+        return {status: "running", step: 1, total_steps: 5, step_label: "Waiting for GitHub to start the run"};
+      }
+      ar.id = run.id;
+      if (run.status === "completed") {
+        GH.activeRun = null;
+        if (run.conclusion === "success") return {status: "done", step: 5, total_steps: 5, step_label: "Complete"};
+        return {status: "failed", step: 0, total_steps: 5,
+                step_label: "GitHub run " + (run.conclusion || "failed") + " — open the Actions tab for details"};
+      }
+      if (run.status === "queued") return {status: "running", step: 1, total_steps: 5, step_label: "Queued on GitHub"};
+      return GH.actions("/runs/" + run.id + "/jobs").then(function(j) {
+        var steps = ((j.jobs || [])[0] || {}).steps || [];
+        var cur = steps.filter(function(s) { return s.status === "in_progress"; })[0] ||
+                  steps.filter(function(s) { return s.status === "completed"; }).slice(-1)[0];
+        var stage = [1, "Preparing the GitHub runner"];
+        GH.RUN_STAGES.forEach(function(st) { if (cur && st[0].test(cur.name)) stage = [st[1], st[2]]; });
+        return {status: "running", step: stage[0], total_steps: 5, step_label: stage[1]};
+      });
+    });
+  },
+
+  askRunToken: function() {
+    if (GH.cfg().runToken) return Promise.resolve();
+    return new Promise(function(resolve, reject) {
+      var box = document.createElement("div");
+      box.id = "gh-runtoken";
+      box.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(3,10,18,0.92);display:flex;align-items:center;justify-content:center;padding:16px";
+      box.innerHTML =
+        '<div style="max-width:420px;width:100%;background:#071321;border:1px solid rgba(14,165,201,0.25);border-radius:14px;padding:20px;color:#D8EEFF;font-size:13px">' +
+          '<div style="font-size:15px;font-weight:700;margin-bottom:6px">⚡ Run token</div>' +
+          '<div style="color:#8BA3BC;font-size:11px;margin-bottom:14px">A fine-grained GitHub token for ' + escHtml(GH.repo()) + ' only, with Actions: read and write. Kept in this browser only.</div>' +
+          '<input id="gh-runtoken-in" type="password" autocomplete="off" style="width:100%;box-sizing:border-box;margin:4px 0 14px;padding:10px;border-radius:8px;border:1px solid rgba(14,165,201,0.3);background:#0A1520;color:#D8EEFF;font-size:14px">' +
+          '<div style="display:flex;gap:8px"><button id="gh-runtoken-cancel" style="flex:1;padding:12px;border:1px solid rgba(14,165,201,0.3);border-radius:10px;background:transparent;color:#8BA3BC">Cancel</button>' +
+          '<button id="gh-runtoken-ok" style="flex:2;padding:12px;border:0;border-radius:10px;background:linear-gradient(135deg,#0B4F6C,#0EA5C9);color:#fff;font-weight:700">Save</button></div>' +
+        '</div>';
+      document.body.appendChild(box);
+      document.getElementById("gh-runtoken-cancel").onclick = function() { box.remove(); reject(new Error("Run cancelled — no Run token")); };
+      document.getElementById("gh-runtoken-ok").onclick = function() {
+        var t = document.getElementById("gh-runtoken-in").value.trim();
+        if (!t) return;
+        var c = GH.cfg(); c.runToken = t;
+        try { localStorage.setItem(GH.CFG_KEY, JSON.stringify(c)); } catch(e) {}
+        box.remove(); resolve();
+      };
+    });
   },
 
   // Connect form, shown until a Gist ID, token and passphrase are set
@@ -1003,7 +1138,9 @@ var GH = {
       var remember = document.getElementById("gh-remember").checked;
       if (!gistId || !token || !pass) { GH.showConnect(onDone, "Fill in all three fields"); return; }
       try {
-        localStorage.setItem(GH.CFG_KEY, JSON.stringify({gistId: gistId, gistToken: token, remember: remember}));
+        var keep = GH.cfg();   // keeps the Run token and repo
+        keep.gistId = gistId; keep.gistToken = token; keep.remember = remember;
+        localStorage.setItem(GH.CFG_KEY, JSON.stringify(keep));
         localStorage.removeItem(GH.PASS_KEY); sessionStorage.removeItem(GH.PASS_KEY);
         (remember ? localStorage : sessionStorage).setItem(GH.PASS_KEY, pass);
       } catch(e) {}
@@ -1129,7 +1266,7 @@ function triggerAgentRun() {
     var currentTimestamp = currentData ? (currentData.saved_at || currentData.analysis_date || "") : "";
 
     var pollCount = 0;
-    var maxPolls  = 90; // 90 x 5s = 7.5 minutes — 10 real pipeline steps
+    var maxPolls  = GH_MODE ? 240 : 90; // 90 x 5s = 7.5 minutes (GitHub: 20 min, the runner queues and installs first) — 10 real pipeline steps
                         // (data fetch, several monitors, the main Claude
                         // call, portfolio analysis, alerts) spanning
                         // several separate processes; the Claude call
@@ -1151,7 +1288,7 @@ function triggerAgentRun() {
           resetButtonStyle(btn, ORIGINAL_BG, RUN_ICON_LABEL);
           btn.disabled = false;
           st.style.color = "#FF4D6A";
-          st.textContent = "⚠️ " + (d.step_label || "Run failed") + " — check ~/market-agent/logs/trigger.log";
+          st.textContent = "⚠️ " + (d.step_label || "Run failed") + (GH_MODE ? "" : " — check ~/market-agent/logs/trigger.log");
           return;
         }
 
