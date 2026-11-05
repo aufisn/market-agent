@@ -1075,13 +1075,19 @@ var GH = {
 
   handle: function(u, opts) {
     var method = ((opts && opts.method) || "GET").toUpperCase();
-    if (method === "GET" && u.pathname === "/api/file" && u.searchParams.get("name") === "logs/agent_run_status.json") {
-      return GH.runStatus().then(function(s) {
+    var statusTask = method === "GET" && u.pathname === "/api/file" && GH.STATUS_TASK[u.searchParams.get("name")];
+    if (statusTask) {
+      return GH.runStatus(statusTask).then(function(s) {
+        if (s && s.reload) return GH.load(true).then(function() { return GH.handleFile(u); });
         return s ? GH.respond(200, JSON.stringify(s)) : GH.handleFile(u);
       }, function() { return GH.handleFile(u); });
     }
     if (method === "GET" && (u.pathname === "/latest.json" || u.pathname === "/api/file")) return GH.handleFile(u);
-    if (method === "POST" && u.pathname === "/api/run") return GH.startRun();
+    if (method === "POST" && u.pathname === "/api/run") return GH.startTask("agent");
+    if (method === "POST" && u.pathname === "/api/premarket-run") return GH.startTask("premarket");
+    if (method === "POST" && u.pathname === "/api/refresh-universe") return GH.startTask("universe");
+    if (method === "POST" && u.pathname === "/api/stock-insight") return GH.startInsight(opts);
+    if (method === "POST" && u.pathname === "/api/reset-simulator") return GH.resetSimulator();
     if (method === "POST" && (u.pathname === "/api/file" || u.pathname === "/api/record-trade")) return GH.saveEdit(u, opts);
     // Other buttons and edits arrive in later steps; until then say so plainly
     showToast("☁️ On GitHub this button isn't wired yet — Run and edits work; the rest comes next");
@@ -1136,67 +1142,131 @@ var GH = {
     });
   },
 
-  startRun: function() {
+  // One workflow, several tasks (run.yml's "task" input). The status file
+  // each button polls is answered from the live GitHub run while its task
+  // runs; once it succeeds, from the refreshed Gist.
+  STATUS_TASK: {
+    "logs/agent_run_status.json": "agent",
+    "logs/premarket_status.json": "premarket",
+    "logs/stock_insight_status.json": "insight",
+    "logs/universe_refresh_status.json": "universe"
+  },
+  TASK_LABEL: {
+    agent: "Running the pipeline (about 5 minutes)",
+    premarket: "Running the pre-market scan",
+    insight: "Analyzing",
+    universe: "Refreshing the stock list (30–90 minutes)",
+    reset_simulator: "Resetting the simulator"
+  },
+
+  startTask: function(task, extra) {
+    extra = extra || {};
     return GH.askRunToken()
       .then(GH.latestRun)
       .then(function(run) {
-        if (run && run.status !== "completed") {           // one run at a time, like the laptop's lock
-          GH.activeRun = {id: run.id, since: Date.parse(run.created_at)};
-          return GH.respond(409, JSON.stringify({status: "busy"}));
+        if (run && run.status !== "completed") {
+          var busy = run.display_title || "agent";
+          if (task === "agent" && busy === "agent") {        // follow it, like the laptop's lock
+            GH.activeRun = {id: run.id, task: "agent", since: Date.parse(run.created_at)};
+            return GH.respond(409, JSON.stringify({status: "busy"}));
+          }
+          // GitHub keeps one waiting job and cancels any earlier one, so never queue
+          showToast("⏳ GitHub is busy with " + busy.replace("_", " ") + " — try again when it finishes");
+          return GH.respond(423, JSON.stringify({status: "busy", message: "GitHub is busy with " + busy}));
         }
-        return GH.actions("/workflows/" + GH.WORKFLOW + "/dispatches", {method: "POST", body: {ref: "main"}})
+        var inputs = {task: task};
+        if (extra.ticker_enc) inputs.ticker_enc = extra.ticker_enc;
+        return GH.actions("/workflows/" + GH.WORKFLOW + "/dispatches", {method: "POST", body: {ref: "main", inputs: inputs}})
           .then(function() {
-            GH.activeRun = {id: null, since: Date.now()};
+            GH.activeRun = {id: null, task: task, ticker: extra.ticker, since: Date.now()};
             return GH.respond(200, JSON.stringify({status: "started"}));
           });
       })
       .catch(function(err) {
         showToast("⚠️ " + err.message);
-        return GH.respond(502, JSON.stringify({error: err.message}));
+        return GH.respond(502, JSON.stringify({status: "error", error: err.message, message: err.message}));
       });
   },
 
-  // The live state of the GitHub run as a run-status file (same shape as
-  // write_progress.py), or null when no run is being followed
+  startInsight: function(opts) {
+    var t = {}; try { t = JSON.parse((opts && opts.body) || "{}"); } catch(e) {}
+    var ticker = String(t.ticker || "").trim().toUpperCase();
+    if (!/^[A-Z0-9.\-]{1,10}$/.test(ticker)) return Promise.resolve(GH.respond(400, JSON.stringify({status: "error", message: "Invalid ticker"})));
+    // Run inputs are public on a public repo, so the ticker goes encrypted
+    return GH.encrypt(ticker, GH.pass()).then(function(enc) {
+      return GH.startTask("insight", {ticker: ticker, ticker_enc: enc});
+    });
+  },
+
+  // The laptop resets synchronously; here: start the task, wait for it
+  resetSimulator: function() {
+    return GH.startTask("reset_simulator").then(function(r) {
+      if (r.status !== 200) return GH.respond(200, JSON.stringify({status: "done", success: false}));
+      var waitDone = function(n) {
+        return new Promise(function(res) { setTimeout(res, 5000); })
+          .then(function() { return GH.runStatus("reset_simulator"); })
+          .then(function(st) {
+            if (st && st.reload) return GH.load(true).then(function() { return true; });
+            if (st && st.failed) return false;
+            return n > 120 ? false : waitDone(n + 1);
+          });
+      };
+      return waitDone(0).then(function(ok) {
+        return GH.respond(200, JSON.stringify({status: "done", success: ok, archived: ok}));
+      });
+    });
+  },
+
+  // Live state of the GitHub run for one task: a status object shaped like
+  // that task's own status file, {reload: true} once it succeeded (serve the
+  // refreshed Gist copy), or null when that task isn't running
   RUN_STAGES: [
     [/^Set up job|checkout|setup-python|Install packages/i, 1, "Preparing the GitHub runner"],
     [/^Restore state/i, 2, "Decrypting your data"],
-    [/^Run the pipeline/i, 3, "Running the pipeline (about 5 minutes)"],
+    [/^Run the (task|pipeline)/i, 3, null],
     [/^Save state/i, 4, "Saving encrypted results"]
   ],
 
-  runStatus: function() {
+  runStatus: function(task) {
     var c = GH.cfg();
     if (!c.runToken) return Promise.resolve(null);
     var ar = GH.activeRun;
+    if (ar && ar.task !== task) return Promise.resolve(null);
     var find = ar && ar.id ? GH.actions("/runs/" + ar.id) : GH.latestRun();
     return find.then(function(run) {
       if (!ar) {                                            // page load: follow a run started elsewhere
-        if (!run || run.status === "completed") return null;
-        ar = GH.activeRun = {id: run.id, since: Date.parse(run.created_at)};
+        if (!run || run.status === "completed" || (run.display_title || "agent") !== task) return null;
+        ar = GH.activeRun = {id: run.id, task: task, since: Date.parse(run.created_at)};
       }
+      var shape = function(o) {                             // insight/universe report done+success, others a step
+        if (task === "insight") o.ticker = ar.ticker || "";
+        return o;
+      };
       if (!run || Date.parse(run.created_at) < ar.since - 60000) {
-        return {status: "running", step: 1, total_steps: 5, step_label: "Waiting for GitHub to start the run"};
+        return shape({status: "running", step: 1, total_steps: 5, step_label: "Waiting for GitHub to start the run"});
       }
       ar.id = run.id;
       if (run.status === "completed") {
         GH.activeRun = null;
-        if (run.conclusion === "success") return {status: "done", step: 5, total_steps: 5, step_label: "Complete"};
-        return {status: "failed", step: 0, total_steps: 5,
-                step_label: "GitHub run " + (run.conclusion || "failed") + " — open the Actions tab for details"};
+        if (run.conclusion === "success") return {reload: true};
+        var why = "GitHub run " + (run.conclusion || "failed") + " — open the Actions tab for details";
+        return (task === "insight" || task === "universe")
+          ? shape({status: "done", success: false, reason: why, failed: true})
+          : {status: "failed", step: 0, total_steps: 5, step_label: why, failed: true};
       }
-      if (run.status === "queued") return {status: "running", step: 1, total_steps: 5, step_label: "Queued on GitHub"};
+      if (run.status === "queued") return shape({status: "running", step: 1, total_steps: 5, step_label: "Queued on GitHub"});
       return GH.actions("/runs/" + run.id + "/jobs").then(function(j) {
         var steps = ((j.jobs || [])[0] || {}).steps || [];
         var cur = steps.filter(function(s) { return s.status === "in_progress"; })[0] ||
                   steps.filter(function(s) { return s.status === "completed"; }).slice(-1)[0];
         var stage = [1, "Preparing the GitHub runner"];
-        GH.RUN_STAGES.forEach(function(st) { if (cur && st[0].test(cur.name)) stage = [st[1], st[2]]; });
-        return {status: "running", step: stage[0], total_steps: 5, step_label: stage[1]};
+        GH.RUN_STAGES.forEach(function(st) {
+          if (cur && st[0].test(cur.name)) stage = [st[1], st[2] || (GH.TASK_LABEL[task] + (task === "insight" ? " " + (ar.ticker || "") : ""))];
+        });
+        return shape({status: "running", step: stage[0], total_steps: 5, step_label: stage[1]});
       });
     });
   },
-
   askRunToken: function() {
     if (GH.cfg().runToken) return Promise.resolve();
     return new Promise(function(resolve, reject) {

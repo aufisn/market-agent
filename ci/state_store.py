@@ -18,6 +18,7 @@
 #                                      into ~/market-agent)
 #   state_store.py push                save state + dashboard bundle
 #   state_store.py seed --from DIR     first upload from the laptop install
+#   state_store.py open-input VAR OUT  decrypt an encrypted workflow input
 #
 # Environment: MA_PASSPHRASE, MA_GIST_ID, MA_GIST_TOKEN (classic token,
 # gist scope). seed prompts for the passphrase and can use `gh auth token`.
@@ -328,6 +329,24 @@ def cmd_seed(args):
     print(f"✓ Seeded the Gist from {src}: {n} files, {size / 1024:.0f} KB compressed")
 
 
+def cmd_open_input(args):
+    """Decrypt a workflow input (the dashboard encrypts the stock-insight
+    ticker: run inputs are public on a public repo) into a file — never
+    to the log."""
+    text = os.getenv(args.var, "")
+    if not text:
+        sys.exit(f"✗ {args.var} is empty")
+    value = decrypt(text, _passphrase()).decode().strip()
+    try:
+        parsed = json.loads(value)          # the browser encrypts JSON text ("BRK.B")
+        if isinstance(parsed, str):
+            value = parsed.strip()
+    except ValueError:
+        pass
+    with open(args.out, "w") as f:
+        f.write(value)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Encrypted Market Agent state in a secret Gist")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -340,9 +359,12 @@ def main():
     s = sub.add_parser("seed")
     s.add_argument("--from", dest="source", required=True, help="folder holding the current state")
     s.add_argument("--overwrite", action="store_true")
+    o = sub.add_parser("open-input")
+    o.add_argument("var", help="environment variable holding the encrypted input")
+    o.add_argument("out", help="file to write the plain value to")
     args = ap.parse_args()
     try:
-        {"pull": cmd_pull, "push": cmd_push, "seed": cmd_seed}[args.cmd](args)
+        {"pull": cmd_pull, "push": cmd_push, "seed": cmd_seed, "open-input": cmd_open_input}[args.cmd](args)
     except ValueError as e:
         sys.exit(f"✗ {e}")
 

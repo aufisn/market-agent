@@ -1,16 +1,30 @@
-# Market Agent V4.5 — full pipeline on GitHub's computers.
-# Started by hand (the dashboard's Run button, or the Actions tab → Run
+# Market Agent V4.5 — runs on GitHub's computers.
+# Started by hand (the dashboard's buttons, or the Actions tab → Run
 # workflow); there is no schedule.
 #
-# This repo is public, so its Actions logs are public too. The pipeline's
-# own output (holdings, P&L, picks) is written to logs/runs/ inside the
-# encrypted state, never to this log; only step names and pass/fail show here.
+# This repo is public, so its Actions logs and run inputs are public too.
+# Each task's own output (holdings, P&L, picks) is written to logs/runs/
+# inside the encrypted state, never to this log; the stock-insight ticker
+# arrives encrypted. Only task names and pass/fail show here.
 name: Run Market Agent
+run-name: ${{ inputs.task || 'agent' }}
 
 on:
   workflow_dispatch:
+    inputs:
+      task:
+        description: What to run
+        type: choice
+        options: [agent, premarket, insight, universe, reset_simulator]
+        default: agent
+      ticker_enc:
+        description: "insight only: the ticker, encrypted by the dashboard"
+        required: false
+        default: ""
 
-# One run at a time: two runs would overwrite each other's state
+# One job at a time: two would overwrite each other's state. The
+# dashboard refuses to start a job while one is running, because GitHub
+# keeps only one waiting job per group and cancels any earlier one.
 concurrency:
   group: market-agent-state
   cancel-in-progress: false
@@ -21,13 +35,15 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The stock-list refresh checks thousands of tickers (30–90 min)
+    timeout-minutes: ${{ inputs.task == 'universe' && 150 || 45 }}
     env:
       TZ: Asia/Muscat
       MA_BASE_DIR: ${{ github.workspace }}
       MA_PASSPHRASE: ${{ secrets.MA_PASSPHRASE }}
       MA_GIST_ID: ${{ secrets.MA_GIST_ID }}
       MA_GIST_TOKEN: ${{ secrets.MA_GIST_TOKEN }}
+      TASK: ${{ inputs.task || 'agent' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -47,28 +63,48 @@ jobs:
         id: pull
         run: python ci/state_store.py pull --apply-inbox
 
-      - name: Run the pipeline (output kept private)
+      - name: Run the task (output kept private)
         id: pipeline
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TICKER_ENC: ${{ inputs.ticker_enc }}
         run: |
           mkdir -p logs/runs
-          OUT="logs/runs/agent_$(date -u +%Y%m%dT%H%M%S).txt"
+          OUT="logs/runs/${TASK}_$(date -u +%Y%m%dT%H%M%S).txt"
           set +e
-          bash run_agent.sh > "$OUT" 2>&1
-          CODE=$?
+          case "$TASK" in
+            agent)     bash run_agent.sh > "$OUT" 2>&1; CODE=$?; STATUS=logs/agent_run_status.json ;;
+            premarket) bash premarket_run.sh > "$OUT" 2>&1; CODE=$?; STATUS=logs/premarket_status.json ;;
+            insight)
+              STATUS=""   # its status names the ticker — never printed here
+              python ci/state_store.py open-input TICKER_ENC .ticker && TICKER=$(cat .ticker); rm -f .ticker
+              if [[ "$TICKER" =~ ^[A-Z0-9.-]{1,10}$ ]]; then
+                python stock_insight.py "$TICKER" > "$OUT" 2>&1; CODE=$?
+              else
+                echo "Invalid or missing ticker"; CODE=2
+              fi ;;
+            universe)  python refresh_universe.py > "$OUT" 2>&1; CODE=$?; STATUS=logs/universe_refresh_status.json ;;
+            reset_simulator)
+              STATUS=""
+              if [ -f logs/simulator_state.json ]; then
+                mv logs/simulator_state.json "logs/simulator_state_archive_$(date +%Y%m%d_%H%M%S).json"
+              fi
+              python simulator.py > "$OUT" 2>&1; CODE=$? ;;
+            *) echo "Unknown task"; CODE=2 ;;
+          esac
           set -e
-          python - <<'PY'
-          import json
+          if [ -n "$STATUS" ]; then STATUS_FILE="$STATUS" python - <<'PY'
+          import json, os
           try:
-              s = json.load(open("logs/agent_run_status.json"))
-              print(f"Pipeline status: {s.get('status')} — step {s.get('step')}/{s.get('total_steps')}: {s.get('step_label')}")
+              s = json.load(open(os.environ["STATUS_FILE"]))
+              print(f"Status: {s.get('status')} — step {s.get('step')}/{s.get('total_steps')}: {s.get('step_label')}")
           except Exception:
-              print("Pipeline status: unknown (no status file)")
+              print("Status: unknown (no status file)")
           PY
-          echo "Exit code: $CODE (full output is in the encrypted state, $OUT)"
+          fi
+          echo "Task $TASK — exit code: $CODE (full output is in the encrypted state)"
           exit $CODE
 
       - name: Save state to the Gist

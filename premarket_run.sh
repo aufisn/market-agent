@@ -16,7 +16,7 @@
 #   Step 6  — Send pre-market Telegram brief
 # ============================================================
 
-BASE_DIR="$HOME/market-agent"
+BASE_DIR="${MA_BASE_DIR:-$HOME/market-agent}"   # GitHub Actions sets MA_BASE_DIR to the checkout
 VENV="$BASE_DIR/venv/bin/activate"
 
 # Write Python output to the log as it happens, not in buffered chunks
@@ -31,7 +31,11 @@ echo "======================================================="
 echo ""
 
 cd "$BASE_DIR" || { echo "✗ Cannot find $BASE_DIR"; exit 1; }
-source "$VENV" || { echo "✗ Cannot activate venv"; exit 1; }
+if [ -f "$VENV" ]; then
+    source "$VENV" || { echo "✗ Cannot activate venv"; exit 1; }
+elif [ -z "$CI" ]; then
+    echo "✗ Cannot find venv at $VENV"; exit 1
+fi   # on GitHub Actions (CI set) packages are installed system-wide
 
 # ── RUN LOCK + RUN ID ─────────────────────────────────────────
 # One Claude-spending run at a time: a double-tap on Run, or two open
