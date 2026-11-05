@@ -205,6 +205,27 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .wl-table th{font-size:9px;color:#4585B7;text-transform:uppercase;letter-spacing:0.07em;font-weight:700;padding:7px 8px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.05)}
 .wl-table td{font-size:11px;color:#5A8AAA;padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.03);vertical-align:middle;font-family:'JetBrains Mono',monospace}
 .wl-table tr:hover td{background:rgba(14,165,201,0.03)}
+/* Folded phone (Fold cover, < 560px): each watchlist row becomes a small card,
+   three values per line, instead of a 9-column table scrolled sideways. */
+@media (max-width:559px){
+  .wl-table{min-width:0}
+  .wl-table thead{display:none}
+  .wl-table tr{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 8px;padding:10px 4px;border-bottom:1px solid rgba(255,255,255,0.05)}
+  .wl-table td{display:block;padding:0;border:0}
+  .wl-table td[data-label]::before{content:attr(data-label);display:block;font-size:8px;color:#4585B7;text-transform:uppercase;letter-spacing:0.07em;font-family:'Inter',sans-serif;font-weight:700;margin-bottom:2px}
+  .wl-table td[data-label="Ticker"]{grid-column:1 / span 2}
+  .wl-table td[data-label="Ticker"]::before,.wl-table td[data-label="Type"]::before{display:none}
+  .wl-table td.wl-act{grid-column:1 / -1;display:flex;gap:6px}
+  .wl-table td.wl-act button{flex:1;padding:7px 0;font-size:11px}
+  .wl-table .ei{width:100% !important;padding:6px;font-size:12px}
+}
+/* Unfolded Fold (>= 640px): the table fits without scrolling, and holdings /
+   watched cards sit two across. The narrow layout is untouched. */
+@media (min-width:640px){
+  .wl-table{min-width:0}
+  #inn-h,#inn-i{display:grid;grid-template-columns:1fr 1fr;gap:0 9px;align-items:start}
+  #inn-h>.no-data,#inn-i>.no-data{grid-column:1 / -1}
+}
 .tc{font-weight:700;color:#D8EEFF}
 .tbH{font-size:9px;font-weight:700;padding:2px 7px;border-radius:20px;background:rgba(0,200,150,0.1);color:#00C896;font-family:sans-serif}
 .tbI{font-size:9px;font-weight:700;padding:2px 7px;border-radius:20px;background:rgba(240,165,0,0.1);color:#F0A500;font-family:sans-serif}
@@ -465,7 +486,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     <button class="btn-load" onclick="fetchFromServer()" style="margin-bottom:0;flex:0 0 auto;padding:11px 20px;width:auto">
       🔄 Refresh
     </button>
-    <label style="flex:0 0 auto;cursor:pointer;padding:11px 16px;border:1px solid rgba(14,165,201,0.2);border-radius:10px;font-size:12px;color:#4390B9;white-space:nowrap">
+    <label id="open-file-lbl" style="flex:0 0 auto;cursor:pointer;padding:11px 16px;border:1px solid rgba(14,165,201,0.2);border-radius:10px;font-size:12px;color:#4390B9;white-space:nowrap">
       📂 Open file
       <input type="file" accept=".json" style="display:none" onchange="loadFile(this)">
     </label>
@@ -1368,6 +1389,8 @@ if (GH_MODE) {
     return GH.origFetch(url, opts);
   };
   window.addEventListener("load", function() {
+    var of = document.getElementById("open-file-lbl");   // no local files on the phone
+    if (of) of.style.display = "none";
     var lbl = document.getElementById("live-lbl");
     if (lbl) lbl.onclick = function() {
       if (confirm("Reconnect to your Gist? (Cancel keeps the current connection)")) GH.disconnect();
@@ -2621,7 +2644,7 @@ function toggleCard(id) {
 function switchInner(tab) {
   ["h","i","p"].forEach(function(t) {
     var el = document.getElementById("inn-"+t);
-    if (el) el.style.display = t===tab ? "block" : "none";
+    if (el) el.style.display = t===tab ? "" : "none";
   });
   document.querySelectorAll("#top-watchlist .itab").forEach(function(el, i) {
     el.className = "itab";
@@ -4171,27 +4194,27 @@ function renderWL() {
     var tl = s.list_type==="holding"?"Hold":"Watch";
     if (i===editIdx) {
       html += '<tr class="erow">' +
-        '<td class="tc">'+s.ticker+'</td>' +
-        '<td><select class="ei" id="et-'+i+'" style="width:70px"><option value="holding"'+(s.list_type==="holding"?" selected":"")+'>Hold</option><option value="interested"'+(s.list_type==="interested"?" selected":"")+'>Watch</option></select></td>' +
-        '<td><input class="ei" id="eq-'+i+'" value="'+(s.quantity||0)+'" type="number" style="width:50px"></td>' +
-        '<td><input class="ei" id="eb-'+i+'" value="'+(s.buy_price||"")+'" type="number" step="0.01" style="width:60px"></td>' +
-        '<td><input class="ei" id="eg-'+i+'" value="'+(s.target||"")+'" type="number" step="0.01" style="width:60px"></td>' +
-        '<td><input class="ei" id="es-'+i+'" value="'+(s.stop_loss||"")+'" type="number" step="0.01" style="width:55px"></td>' +
-        '<td><input class="ei" id="ea-'+i+'" value="'+(s.alert_above||"")+'" type="number" step="0.01" style="width:55px"></td>' +
-        '<td><input class="ei" id="eb2-'+i+'" value="'+(s.alert_below||"")+'" type="number" step="0.01" style="width:55px"></td>' +
-        '<td style="white-space:nowrap"><button class="save-btn" onclick="saveEdit('+i+')">Save</button><button class="cancel-btn" onclick="cancelEdit()">✕</button></td>' +
+        '<td data-label="Ticker" class="tc">'+s.ticker+'</td>' +
+        '<td data-label="Type"><select class="ei" id="et-'+i+'" style="width:70px"><option value="holding"'+(s.list_type==="holding"?" selected":"")+'>Hold</option><option value="interested"'+(s.list_type==="interested"?" selected":"")+'>Watch</option></select></td>' +
+        '<td data-label="Qty"><input class="ei" id="eq-'+i+'" value="'+(s.quantity||0)+'" type="number" style="width:50px"></td>' +
+        '<td data-label="Buy"><input class="ei" id="eb-'+i+'" value="'+(s.buy_price||"")+'" type="number" step="0.01" style="width:60px"></td>' +
+        '<td data-label="Target"><input class="ei" id="eg-'+i+'" value="'+(s.target||"")+'" type="number" step="0.01" style="width:60px"></td>' +
+        '<td data-label="Stop"><input class="ei" id="es-'+i+'" value="'+(s.stop_loss||"")+'" type="number" step="0.01" style="width:55px"></td>' +
+        '<td data-label="Alert ▲"><input class="ei" id="ea-'+i+'" value="'+(s.alert_above||"")+'" type="number" step="0.01" style="width:55px"></td>' +
+        '<td data-label="Alert ▼"><input class="ei" id="eb2-'+i+'" value="'+(s.alert_below||"")+'" type="number" step="0.01" style="width:55px"></td>' +
+        '<td class="wl-act" style="white-space:nowrap"><button class="save-btn" onclick="saveEdit('+i+')">Save</button><button class="cancel-btn" onclick="cancelEdit()">✕</button></td>' +
         '</tr>';
     } else {
       html += '<tr>' +
-        '<td class="tc">'+s.ticker+'<br><span style="font-size:9px;color:#5189B6;font-family:sans-serif;font-weight:400">'+s.name+'</span></td>' +
-        '<td><span class="'+tb+'">'+tl+'</span></td>' +
-        '<td>'+(s.quantity||"—")+'</td>' +
-        '<td>'+(s.buy_price?"$"+s.buy_price:"—")+'</td>' +
-        '<td>'+(s.target?"$"+s.target:"—")+'</td>' +
-        '<td>'+(s.stop_loss?"$"+s.stop_loss:"—")+'</td>' +
-        '<td style="color:#00C896">'+(s.alert_above?"$"+s.alert_above:"—")+'</td>' +
-        '<td style="color:#FF4D6A">'+(s.alert_below?"$"+s.alert_below:"—")+'</td>' +
-        '<td style="white-space:nowrap"><button class="edit-btn" onclick="startEdit('+i+')">Edit</button><button class="remove-btn" onclick="removeStock('+i+')">✕</button></td>' +
+        '<td data-label="Ticker" class="tc">'+s.ticker+'<br><span style="font-size:9px;color:#5189B6;font-family:sans-serif;font-weight:400">'+s.name+'</span></td>' +
+        '<td data-label="Type"><span class="'+tb+'">'+tl+'</span></td>' +
+        '<td data-label="Qty">'+(s.quantity||"—")+'</td>' +
+        '<td data-label="Buy">'+(s.buy_price?"$"+s.buy_price:"—")+'</td>' +
+        '<td data-label="Target">'+(s.target?"$"+s.target:"—")+'</td>' +
+        '<td data-label="Stop">'+(s.stop_loss?"$"+s.stop_loss:"—")+'</td>' +
+        '<td data-label="Alert ▲" style="color:#00C896">'+(s.alert_above?"$"+s.alert_above:"—")+'</td>' +
+        '<td data-label="Alert ▼" style="color:#FF4D6A">'+(s.alert_below?"$"+s.alert_below:"—")+'</td>' +
+        '<td class="wl-act" style="white-space:nowrap"><button class="edit-btn" onclick="startEdit('+i+')">Edit</button><button class="remove-btn" onclick="removeStock('+i+')">✕</button></td>' +
         '</tr>';
     }
   });
