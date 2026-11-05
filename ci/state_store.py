@@ -6,6 +6,8 @@
 # logs/, data/) lives in one secret Gist as two encrypted files:
 #   state.enc      full archive the GitHub Actions run restores and saves
 #   dashboard.enc  just the files the dashboard reads, as one JSON bundle
+#   inbox.enc      edits made on the phone (watchlist, closed positions,
+#                  signals log, recorded trades), applied by the next run
 # A secret Gist is only unlisted, so both are AES-256-GCM encrypted with a
 # key derived (PBKDF2-SHA256) from your passphrase. The envelope matches
 # the browser's WebCrypto, so the dashboard decrypts it with the same
@@ -41,6 +43,10 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_FILE = "state.enc"
 DASHBOARD_FILE = "dashboard.enc"
+INBOX_FILE = "inbox.enc"
+APPLIED_MARK = ".inbox_applied.json"   # app folder, outside the state: op ids applied by pull
+EDITABLE = {"watchlist.csv", "logs/closed_positions.json", "logs/performance_log.json"}
+INBOX_LOG = "logs/inbox_log.json"
 PBKDF2_ITER = 310000
 GIST_API = "https://api.github.com/gists/"
 
@@ -59,7 +65,7 @@ DASHBOARD_PATHS = [
     "logs/premarket_brief.json", "logs/thesis_log.json", "logs/outcome_log.json",
     "logs/correlation_matrix.json", "logs/stock_insight_status.json", "logs/agent_run_status.json",
     "logs/premarket_status.json", "logs/universe_refresh_status.json",
-    "logs/trade_history.json", "logs/simulator_state.json",
+    "logs/trade_history.json", "logs/simulator_state.json", "logs/inbox_log.json",
 ]
 
 
@@ -157,7 +163,7 @@ class Store:
             p = os.path.join(self.dir, name)
             return open(p).read() if os.path.exists(p) else None
         import requests
-        r = requests.get(GIST_API + self.gist_id, headers=self._headers(), timeout=30)
+        r = requests.get(GIST_API + self.gist_id, headers=self._headers(), timeout=30)   # always fresh
         if r.status_code != 200:
             sys.exit(f"✗ Could not read the Gist (HTTP {r.status_code})")
         f = r.json().get("files", {}).get(name)
@@ -181,6 +187,75 @@ class Store:
         r = requests.patch(GIST_API + self.gist_id, headers=self._headers(), json=body, timeout=60)
         if r.status_code != 200:
             sys.exit(f"✗ Could not save to the Gist (HTTP {r.status_code})")
+
+
+# ── PHONE EDITS (inbox) ───────────────────────────────────────
+def read_inbox(store, passphrase):
+    text = store.read(INBOX_FILE)
+    return json.loads(decrypt(text, passphrase)).get("ops", []) if text else []
+
+
+def _check_put(name, content):
+    if name not in EDITABLE:
+        raise ValueError(f"{name} can't be edited from the phone")
+    if not isinstance(content, str) or len(content) > 1_000_000:
+        raise ValueError("content missing or over 1 MB")
+    if name == "watchlist.csv":
+        header = content.lstrip().split("\n", 1)[0]
+        if not header.startswith("ticker,") or "list_type" not in header:
+            raise ValueError("not a watchlist CSV")
+    else:
+        try:
+            ok = isinstance(json.loads(content), (list, dict))
+        except ValueError:
+            ok = False
+        if not ok:
+            raise ValueError("not valid JSON")
+
+
+def apply_inbox(app_dir, ops):
+    """Apply phone edits in the order they were made, with the laptop's own
+    checks. Returns (applied, rejected). Each outcome is kept in
+    logs/inbox_log.json; the edits' content is never printed."""
+    sys.path.insert(0, app_dir)
+    from common import make_trade_entry
+    log_path = os.path.join(app_dir, INBOX_LOG)
+    try:
+        log = json.load(open(log_path))
+    except Exception:
+        log = []
+    applied = rejected = 0
+    for op in sorted(ops, key=lambda o: o.get("at", "")):
+        rec = {"id": op.get("id"), "at": op.get("at"), "type": op.get("type")}
+        try:
+            if op.get("type") == "put":
+                name, content = op.get("name"), op.get("content")
+                _check_put(name, content)
+                with open(os.path.join(app_dir, name), "w", encoding="utf-8") as f:
+                    f.write(content)
+                rec["file"] = name
+            elif op.get("type") == "trade":
+                entry = make_trade_entry(op.get("trade") or {})
+                entry["source"] = "phone"
+                path = os.path.join(app_dir, "logs", "trade_history.json")
+                try:
+                    history = json.load(open(path))
+                except Exception:
+                    history = []
+                history.append(entry)
+                with open(path, "w") as f:
+                    json.dump(history, f, indent=2)
+                rec["ticker"], rec["action"] = entry["ticker"], entry["action"]
+            else:
+                raise ValueError("unknown edit type")
+            rec["status"] = "applied"; applied += 1
+        except Exception as e:
+            rec["status"], rec["message"] = "rejected", str(e)[:200]; rejected += 1
+        log.append(rec)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w") as f:
+        json.dump(log[-100:], f, indent=2)
+    return applied, rejected
 
 
 # ── COMMANDS ──────────────────────────────────────────────────
@@ -208,14 +283,31 @@ def cmd_pull(args):
     text = store.read(STATE_FILE)
     if text is None:
         sys.exit("✗ No state in the Gist yet — run `state_store.py seed` from the laptop first")
-    n = unpack(decrypt(text, _passphrase(prompt=True, confirm=False)), args.app)
+    passphrase = _passphrase(prompt=True, confirm=False)
+    n = unpack(decrypt(text, passphrase), args.app)
     print(f"✓ State restored: {n} files")
+    if args.apply_inbox:
+        ops = read_inbox(store, passphrase)
+        applied, rejected = apply_inbox(args.app, ops) if ops else (0, 0)
+        with open(os.path.join(args.app, APPLIED_MARK), "w") as f:
+            json.dump([o.get("id") for o in ops], f)
+        print(f"✓ Phone edits: {applied} applied, {rejected} rejected")
 
 
 def save(app_dir, store, passphrase):
     blob = pack(app_dir)
-    store.write({STATE_FILE: encrypt(blob, passphrase),
-                 DASHBOARD_FILE: encrypt(dashboard_bundle(app_dir), passphrase)})
+    files = {STATE_FILE: encrypt(blob, passphrase),
+             DASHBOARD_FILE: encrypt(dashboard_bundle(app_dir), passphrase)}
+    mark = os.path.join(app_dir, APPLIED_MARK)
+    if os.path.exists(mark):
+        # Drop only the edits this run applied: ones made on the phone
+        # while it ran stay pending for the next run.
+        done = set(json.load(open(mark)))
+        remaining = [o for o in read_inbox(store, passphrase) if o.get("id") not in done]
+        files[INBOX_FILE] = encrypt(json.dumps({"ops": remaining}).encode(), passphrase)
+    store.write(files)
+    if os.path.exists(mark):
+        os.remove(mark)
     return len(_state_files(app_dir)), len(blob)
 
 
@@ -242,6 +334,9 @@ def main():
     for name in ("pull", "push"):
         p = sub.add_parser(name)
         p.add_argument("--app", default=APP_DIR, help="app folder (default: the repo root)")
+        if name == "pull":
+            p.add_argument("--apply-inbox", action="store_true",
+                           help="apply pending phone edits (GitHub runs); push then clears them")
     s = sub.add_parser("seed")
     s.add_argument("--from", dest="source", required=True, help="folder holding the current state")
     s.add_argument("--overwrite", action="store_true")

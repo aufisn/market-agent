@@ -12,10 +12,12 @@ import threading
 import json
 import os
 import sys
-import uuid
 import hmac
 import time
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import make_trade_entry
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN    = open(os.path.join(BASE_DIR, ".trigger_token")).read().strip()
@@ -322,47 +324,15 @@ class TriggerHandler(BaseHTTPRequestHandler):
                 self.send_response(401); self.end_headers()
                 self.wfile.write(b"Unauthorized"); return
 
-            ticker     = str(body.get("ticker", "")).strip().upper()
-            action     = str(body.get("action", "")).strip().upper()
-            quantity   = body.get("quantity")
-            price      = body.get("price")
-            commission = body.get("commission", 0)
-            trade_date = body.get("trade_date") or datetime.now().isoformat()
-            sector     = body.get("sector") or ""
-            note       = str(body.get("note", ""))[:300]
-
-            def bad(msg):
+            try:
+                entry = make_trade_entry(body)
+            except ValueError as e:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self._cors()
                 self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": msg}).encode())
-
-            if not ticker or len(ticker) > 10 or not all(c.isalnum() or c in ".-" for c in ticker):
-                bad("Invalid ticker"); return
-            if action not in ("BUY", "SELL"):
-                bad("action must be BUY or SELL"); return
-            try:
-                quantity = float(quantity)
-                price = float(price)
-                commission = float(commission) if commission not in (None, "") else 0.0
-            except (TypeError, ValueError):
-                bad("quantity, price, and commission must be numbers"); return
-            if quantity <= 0 or price <= 0 or commission < 0:
-                bad("quantity and price must be > 0, commission must be >= 0"); return
-
-            entry = {
-                "id":          uuid.uuid4().hex[:12],
-                "recorded_at": datetime.now().isoformat(),
-                "trade_date":  trade_date,
-                "ticker":      ticker,
-                "action":      action,
-                "quantity":    quantity,
-                "price":       price,
-                "commission":  commission,
-                "sector":      sector,
-                "note":        note,
-            }
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
+                return
 
             with _trade_history_lock:
                 history = []

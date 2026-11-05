@@ -902,16 +902,25 @@ var GH = {
     })
     .then(function(r) { if (!r.ok) throw new Error(GH.apiError(r.status)); return r.json(); })
     .then(function(g) {
-      var f = (g.files || {})["dashboard.enc"];
-      if (!f) throw new Error("The Gist has no dashboard.enc yet — run Market Agent on GitHub once");
-      if (!f.truncated) return {text: f.content, updated: g.updated_at};
-      return GH.origFetch(f.raw_url, {cache: "no-store"})
-        .then(function(r) { if (!r.ok) throw new Error("Could not read the full Gist file"); return r.text(); })
-        .then(function(t) { return {text: t, updated: g.updated_at}; });
+      var files = g.files || {};
+      if (!files["dashboard.enc"]) throw new Error("The Gist has no dashboard.enc yet — run Market Agent on GitHub once");
+      var read = function(f) {
+        if (!f) return Promise.resolve(null);
+        if (!f.truncated) return Promise.resolve(f.content);
+        return GH.origFetch(f.raw_url, {cache: "no-store"})
+          .then(function(r) { if (!r.ok) throw new Error("Could not read the full Gist file"); return r.text(); });
+      };
+      return Promise.all([read(files["dashboard.enc"]), read(files["inbox.enc"])]).then(function(t) {
+        return {text: t[0], inbox: t[1], updated: g.updated_at};
+      });
     });
   },
 
   decrypt: function(text, passphrase) {
+    return GH.decryptRaw(text, passphrase).then(function(obj) { return obj.files || {}; });
+  },
+
+  decryptRaw: function(text, passphrase) {
     var env = JSON.parse(text), subtle = window.crypto && window.crypto.subtle;
     if (!subtle) return Promise.reject(new Error("This browser can't decrypt (needs HTTPS)"));
     var b = function(s) { return Uint8Array.from(atob(s), function(ch) { return ch.charCodeAt(0); }); };
@@ -921,11 +930,32 @@ var GH = {
         return subtle.deriveKey({name: "PBKDF2", hash: "SHA-256", salt: b(env.salt), iterations: env.iter},
                                 base, {name: "AES-GCM", length: 256}, false, ["decrypt"]);
       });
-    GH.keys = {}; GH.keys[cacheKey] = keyP;   // one envelope version at a time
+    if (Object.keys(GH.keys).length > 6) GH.keys = {};   // a few envelope versions at a time
+    GH.keys[cacheKey] = keyP;
     return keyP
       .then(function(key) { return subtle.decrypt({name: "AES-GCM", iv: b(env.iv)}, key, b(env.ct)); })
-      .then(function(plain) { return JSON.parse(new TextDecoder().decode(plain)).files || {}; },
+      .then(function(plain) { return JSON.parse(new TextDecoder().decode(plain)); },
             function() { GH.keys = {}; throw new Error("Wrong passphrase, or the data is damaged"); });
+  },
+
+  // Same envelope as ci/state_store.py; one salt + key per page session
+  encrypt: function(obj, passphrase) {
+    var subtle = window.crypto.subtle;
+    var b64 = function(u8) { var s = ""; for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); };
+    if (!GH.encKey) {
+      var salt = crypto.getRandomValues(new Uint8Array(16));
+      GH.encKey = {salt: salt, keyP: subtle.importKey("raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"])
+        .then(function(base) {
+          return subtle.deriveKey({name: "PBKDF2", hash: "SHA-256", salt: salt, iterations: 310000},
+                                  base, {name: "AES-GCM", length: 256}, false, ["encrypt"]);
+        })};
+    }
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    return GH.encKey.keyP.then(function(key) {
+      return subtle.encrypt({name: "AES-GCM", iv: iv}, key, new TextEncoder().encode(JSON.stringify(obj)));
+    }).then(function(ct) {
+      return JSON.stringify({v: 1, kdf: "PBKDF2-SHA256", iter: 310000, salt: b64(GH.encKey.salt), iv: b64(iv), ct: b64(new Uint8Array(ct))});
+    });
   },
 
   // The decrypted bundle; re-checks the Gist at most every 15 s
@@ -937,9 +967,13 @@ var GH = {
       .then(function(g) {
         GH.checkedAt = Date.now();
         if (GH.bundle && g.updated === GH.version) return GH.bundle;
-        return GH.decrypt(g.text, GH.pass()).then(function(files) {
-          GH.bundle = files; GH.version = g.updated; return files;
-        });
+        return Promise.all([GH.decrypt(g.text, GH.pass()),
+                            g.inbox ? GH.decryptRaw(g.inbox, GH.pass()) : Promise.resolve({ops: []})])
+          .then(function(r) {
+            GH.base = r[0]; GH.ops = r[1].ops || []; GH.version = g.updated;
+            GH.bundle = GH.overlay(GH.base, GH.ops);
+            return GH.bundle;
+          });
       })
       .then(function(files) { GH.pending = null; GH.setChip(true); return files; },
             function(err) { GH.pending = null; GH.setChip(false, err.message); throw err; });
@@ -948,6 +982,89 @@ var GH = {
 
   // /api/file?name=X uses trigger.py's names: "watchlist.csv", "logs/…",
   // or a bare log name like "performance_log.json"
+  // ── Phone edits (5c) ──
+  // Saved encrypted to inbox.enc in the Gist; the next GitHub run applies
+  // them with the laptop's checks (ci/state_store.py apply_inbox). Until
+  // then the dashboard shows them as if applied.
+  EDITABLE: ["watchlist.csv", "logs/closed_positions.json", "logs/performance_log.json"],
+  ops: [], base: null, opQueue: null,
+
+  overlay: function(base, ops) {
+    var files = Object.assign({}, base);
+    ops.forEach(function(op) {
+      if (op.type === "put") files[op.name] = op.content;
+      if (op.type === "trade") {
+        var h = []; try { h = JSON.parse(files["logs/trade_history.json"] || "[]"); } catch(e) {}
+        h.push(Object.assign({id: op.id, recorded_at: op.at, pending: true}, op.trade));
+        files["logs/trade_history.json"] = JSON.stringify(h);
+      }
+    });
+    return files;
+  },
+
+  addOp: function(op) {
+    op.id = Array.from(crypto.getRandomValues(new Uint8Array(6)), function(x) { return ("0" + x.toString(16)).slice(-2); }).join("");
+    op.at = new Date().toISOString();
+    var step = function() {
+      return GH.load(true).then(function() {
+        var ops = GH.ops.concat([op]);
+        return GH.encrypt({ops: ops}, GH.pass()).then(function(text) {
+          var c = GH.cfg();
+          return GH.origFetch(GH.API + "/gists/" + encodeURIComponent(c.gistId), {
+            method: "PATCH",
+            headers: {"Authorization": "token " + c.gistToken, "Accept": "application/vnd.github+json"},
+            body: JSON.stringify({files: {"inbox.enc": {content: text}}})
+          }).then(function(r) {
+            if (!r.ok) throw new Error(GH.apiError(r.status));
+            return r.json();
+          }).then(function(g) {
+            GH.ops = ops; GH.version = g.updated_at;
+            GH.bundle = GH.overlay(GH.base, ops);
+            GH.setChip(true);
+          });
+        });
+      });
+    };
+    GH.opQueue = (GH.opQueue || Promise.resolve()).then(step, step);   // one save at a time, in order
+    return GH.opQueue;
+  },
+
+  // Same rules as common.make_trade_entry, so bad trades are caught on the phone
+  checkTrade: function(t) {
+    var ticker = String(t.ticker || "").trim().toUpperCase(), action = String(t.action || "").trim().toUpperCase();
+    if (!ticker || ticker.length > 10 || !/^[A-Z0-9.\-]+$/.test(ticker)) return "Invalid ticker";
+    if (action !== "BUY" && action !== "SELL") return "action must be BUY or SELL";
+    var q = parseFloat(t.quantity), p = parseFloat(t.price), c = t.commission === "" || t.commission == null ? 0 : parseFloat(t.commission);
+    if (isNaN(q) || isNaN(p) || isNaN(c)) return "quantity, price, and commission must be numbers";
+    if (q <= 0 || p <= 0 || c < 0) return "quantity and price must be > 0, commission must be >= 0";
+    return null;
+  },
+
+  saveEdit: function(u, opts) {
+    var body = (opts && opts.body) || "";
+    var op;
+    if (u.pathname === "/api/file") {
+      var key = GH.fileKey(u.searchParams.get("name") || "");
+      if (GH.EDITABLE.indexOf(key) < 0) return Promise.resolve(GH.respond(400, JSON.stringify({error: key + " can't be edited here"})));
+      op = {type: "put", name: key, content: String(body)};
+    } else {
+      var t = {}; try { t = JSON.parse(body); } catch(e) {}
+      delete t.token;
+      var bad = GH.checkTrade(t);
+      if (bad) return Promise.resolve(GH.respond(400, JSON.stringify({status: "error", message: bad})));
+      op = {type: "trade", trade: t};
+    }
+    return GH.addOp(op).then(function() {
+      showToast("💾 Saved — applied on the next run");
+      return GH.respond(200, JSON.stringify(op.type === "trade"
+        ? {status: "recorded", pending: true, entry: Object.assign({pending: true}, op.trade)}
+        : {status: "saved", pending: true}));
+    }, function(err) {
+      showToast("⚠️ Not saved: " + err.message);
+      return GH.respond(502, JSON.stringify({error: err.message}));
+    });
+  },
+
   fileKey: function(name) {
     return (name === "watchlist.csv" || name.indexOf("logs/") === 0) ? name : "logs/" + name;
   },
@@ -965,8 +1082,9 @@ var GH = {
     }
     if (method === "GET" && (u.pathname === "/latest.json" || u.pathname === "/api/file")) return GH.handleFile(u);
     if (method === "POST" && u.pathname === "/api/run") return GH.startRun();
+    if (method === "POST" && (u.pathname === "/api/file" || u.pathname === "/api/record-trade")) return GH.saveEdit(u, opts);
     // Other buttons and edits arrive in later steps; until then say so plainly
-    showToast("☁️ On GitHub only Run works so far — edits and the other buttons come next");
+    showToast("☁️ On GitHub this button isn't wired yet — Run and edits work; the rest comes next");
     return Promise.resolve(GH.respond(501, JSON.stringify({error: "Not available in GitHub mode yet"})));
   },
 
@@ -1160,7 +1278,12 @@ var GH = {
   // Header label: GITHUB (green) when the Gist read worked
   setChip: function(ok, why) {
     var lbl = document.getElementById("live-lbl"), dot = document.getElementById("live-dot");
-    if (lbl) { lbl.textContent = ok ? "GITHUB" : "GITHUB ⚠"; lbl.title = ok ? "Data from your encrypted Gist — tap to reconnect" : why; lbl.style.cursor = "pointer"; }
+    var n = (GH.ops || []).length;
+    if (lbl) {
+      lbl.textContent = ok ? "GITHUB" + (n ? " · " + n + " pending" : "") : "GITHUB ⚠";
+      lbl.title = ok ? (n ? n + " phone edit(s) waiting for the next run — " : "") + "Data from your encrypted Gist — tap to reconnect" : why;
+      lbl.style.cursor = "pointer";
+    }
     if (dot) dot.style.background = ok ? "#00C896" : "#FF4D6A";
   }
 };
@@ -2092,7 +2215,7 @@ function setHeader(data) {
   var ts  = toOmanTime(raw) || raw;
   document.getElementById("hdr-sub").textContent = "Updated " + ts;
   document.getElementById("live-dot").style.background = "#00C896";
-  document.getElementById("live-lbl").textContent = GH_MODE ? "GITHUB" : "LIVE";
+  document.getElementById("live-lbl").textContent = GH_MODE ? "GITHUB" + ((GH.ops || []).length ? " · " + GH.ops.length + " pending" : "") : "LIVE";
 }
 
 // ── NYSE MARKET STATUS (holiday-aware, DST-aware) ──────────────

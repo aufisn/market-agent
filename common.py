@@ -68,6 +68,41 @@ def trail_width_pct(atr_pct, strategy):
     return max(floor, safe_float(ts.get("atr_multiple"), TRAIL_ATR_MULTIPLE) * safe_float(atr_pct))
 
 
+def make_trade_entry(body):
+    """A validated trade_history.json entry from a Record Trade request
+    (the laptop's /record-trade, or a phone edit applied on GitHub).
+    Raises ValueError with a message the user can act on."""
+    import uuid
+    from datetime import datetime
+    ticker = str(body.get("ticker", "")).strip().upper()
+    action = str(body.get("action", "")).strip().upper()
+    if not ticker or len(ticker) > 10 or not all(c.isalnum() or c in ".-" for c in ticker):
+        raise ValueError("Invalid ticker")
+    if action not in ("BUY", "SELL"):
+        raise ValueError("action must be BUY or SELL")
+    try:
+        quantity = float(body.get("quantity"))
+        price = float(body.get("price"))
+        commission = body.get("commission", 0)
+        commission = float(commission) if commission not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        raise ValueError("quantity, price, and commission must be numbers")
+    if quantity <= 0 or price <= 0 or commission < 0:
+        raise ValueError("quantity and price must be > 0, commission must be >= 0")
+    return {
+        "id":          uuid.uuid4().hex[:12],
+        "recorded_at": datetime.now().isoformat(),
+        "trade_date":  body.get("trade_date") or datetime.now().isoformat(),
+        "ticker":      ticker,
+        "action":      action,
+        "quantity":    quantity,
+        "price":       price,
+        "commission":  commission,
+        "sector":      body.get("sector") or "",
+        "note":        str(body.get("note", ""))[:300],
+    }
+
+
 TELEGRAM_LIMIT = 4096
 
 

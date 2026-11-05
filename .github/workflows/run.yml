@@ -45,7 +45,7 @@ jobs:
 
       - name: Restore state from the Gist
         id: pull
-        run: python ci/state_store.py pull
+        run: python ci/state_store.py pull --apply-inbox
 
       - name: Run the pipeline (output kept private)
         id: pipeline
