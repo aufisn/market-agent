@@ -18,7 +18,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DASHBOARD   = os.path.join(BASE_DIR, "Market_Agent.html")
 LATEST      = os.path.join(BASE_DIR, "logs", "latest.json")
-TRIGGER_API = "http://127.0.0.1:8080"
+TRIGGER_API = "http://127.0.0.1:" + os.getenv("TRIGGER_PORT", "8080")
 PORT        = int(os.getenv("DASHBOARD_PORT", "8000"))
 
 # Headers passed through to trigger.py — the same ones the dashboard sends

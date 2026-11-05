@@ -4934,7 +4934,15 @@ function restoreBackup(input) {
     st.textContent = "⏳ Saving a copy of the current data…";
     var done = GH_MODE ? GH.restore(b) :
       fetch(SERVER_BASE + "/api/restore", {method: "POST", headers: {"X-Token": TRIGGER_TOKEN, "Content-Type": "application/gzip"}, body: b.gz})
-        .then(function(r) { return r.json().then(function(j) { if (!r.ok) throw new Error(j.message || ("HTTP " + r.status)); return j; }); });
+        .then(function(r) {
+          return r.text().then(function(t) {
+            var j = {}; try { j = JSON.parse(t); } catch(e) {}
+            // An empty 404 means the laptop server predates this feature
+            if (r.status === 404) throw new Error("this laptop's Market Agent server is an older version — restart it (bash ~/market-agent/local/start.sh) and try again");
+            if (!r.ok || j.status !== "restored") throw new Error(j.message || ("HTTP " + r.status));
+            return j;
+          });
+        });
     return done.then(function() {
       st.style.color = "#00C896"; st.textContent = "✅ Restored " + b.count + " files from " + file.name + " — reloading…";
       showToast("♻️ Backup restored");

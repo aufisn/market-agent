@@ -492,6 +492,7 @@ if __name__ == "__main__":
     # Localhost only — local/local_server.py proxies /api/* here. Set TRIGGER_HOST=0.0.0.0
     # only if you deliberately want the API reachable from other machines.
     host = os.getenv("TRIGGER_HOST", "127.0.0.1")
-    server = ThreadingHTTPServer((host, 8080), TriggerHandler)
-    print(f"Market Agent API running on {host}:8080")
+    port = int(os.getenv("TRIGGER_PORT", "8080"))
+    server = ThreadingHTTPServer((host, port), TriggerHandler)
+    print(f"Market Agent API running on {host}:{port}")
     server.serve_forever()
