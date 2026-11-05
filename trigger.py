@@ -61,6 +61,55 @@ def local_backup():
     return buf.getvalue()
 
 
+BACKUP_DIR = os.path.expanduser("~/Documents/Market Agent Backups")
+STATE_PARTS = ("watchlist.csv", "logs", "data")
+
+
+def _backup_members(tar):
+    """Entries of a backup, checked like local/restore_local.sh: only
+    watchlist.csv, logs/ and data/, no absolute paths or "..", and a
+    watchlist. macOS "._" metadata entries are skipped."""
+    members, names = [], set()
+    for m in tar.getmembers():
+        name = m.name[2:] if m.name.startswith("./") else m.name
+        if name in ("", ".") or name.split("/")[-1].startswith("._"):
+            continue
+        if (not (m.isfile() or m.isdir()) or name.startswith("/") or ".." in name.split("/")
+                or name.split("/")[0] not in STATE_PARTS):
+            raise ValueError(f"not a Market Agent backup (unexpected entry {m.name})")
+        members.append(m); names.add(name)
+    if "watchlist.csv" not in names:
+        raise ValueError("not a Market Agent backup: no watchlist.csv inside")
+    return members
+
+
+def local_restore(blob):
+    """Replace the laptop's watchlist.csv, logs/ and data/ with a backup,
+    after saving the current data as a -before-restore backup. Returns
+    (files restored, path of the before-restore backup)."""
+    import io, shutil, tarfile
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz")
+        members = _backup_members(tar)
+    except tarfile.TarError:
+        raise ValueError("not a readable .tar.gz backup") from None
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    before = os.path.join(BACKUP_DIR, f"market-agent-backup-{datetime.now():%Y-%m-%d_%H%M%S}-before-restore.tar.gz")
+    with open(before, "wb") as f:
+        f.write(local_backup())
+    os.chmod(before, 0o600)
+    for part in STATE_PARTS:
+        full = os.path.join(BASE_DIR, part)
+        if os.path.isdir(full):
+            shutil.rmtree(full)
+        elif os.path.exists(full):
+            os.remove(full)
+    tar.extractall(BASE_DIR, members=members, filter="data")
+    for d in ("logs", "data"):
+        os.makedirs(os.path.join(BASE_DIR, d), exist_ok=True)
+    return sum(1 for m in members if m.isfile()), before
+
+
 READ_ONLY_FILES = {
     "logs/trade_history.json":   TRADE_HISTORY_PATH,
     "logs/simulator_state.json": os.path.join(BASE_DIR, "logs", "simulator_state.json"),
@@ -195,6 +244,25 @@ class TriggerHandler(BaseHTTPRequestHandler):
 
         length  = int(self.headers.get("Content-Length", 0))
         raw     = self.rfile.read(length) if length else b""
+
+        # ── /restore — load a backup file into the laptop install ──
+        if path == "/restore":
+            if not self._auth():
+                self.send_response(401); self.end_headers()
+                self.wfile.write(b"Unauthorized"); return
+            if self._busy():
+                return
+            try:
+                n, before = local_restore(raw)
+                status, body = 200, {"status": "restored", "files": n, "before": before}
+            except ValueError as e:
+                status, body = 400, {"status": "error", "message": str(e)}
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+            return
 
         # ── /reset-simulator — archive current comparison, start fresh ──
         if path == "/reset-simulator":

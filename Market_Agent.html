@@ -809,13 +809,19 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     <div style="font-size:11px;color:#8BA3BC;line-height:1.6;margin-bottom:10px">
       Saves all your data (watchlist, trades, simulator, logs) as one dated file,
       <code>market-agent-backup-YYYY-MM-DD.tar.gz</code>. It is <b>not encrypted</b>: keep it private.
-      Restore it on the laptop with <code>local/restore_local.sh</code> (no GitHub needed), or back
-      to GitHub with <code>ci/state_store.py restore</code>.
+      <b>Restore</b> replaces the data this dashboard uses (here: <span id="restore-target">this laptop</span>)
+      with a backup file, after saving a copy of the current data. Backups from GitHub and from the
+      laptop are interchangeable.
     </div>
     <button id="backup-btn" onclick="downloadBackup()"
       style="width:100%;padding:12px 6px;border:none;border-radius:10px;background:linear-gradient(135deg,#0B4F6C,#0EA5C9);color:#E8F8FF;font-size:13px;font-weight:700;cursor:pointer">
       💾 Download backup
     </button>
+    <label id="restore-btn"
+      style="display:block;box-sizing:border-box;width:100%;margin-top:8px;padding:12px 6px;border:1px solid rgba(240,165,0,0.35);border-radius:10px;background:rgba(240,165,0,0.06);color:#F0A500;font-size:13px;font-weight:700;cursor:pointer;text-align:center">
+      ♻️ Restore backup…
+      <input type="file" accept=".gz,.tgz,application/gzip" style="display:none" onchange="restoreBackup(this)">
+    </label>
     <div id="backup-status" style="font-size:11px;color:#8BA3BC;text-align:center;min-height:14px;margin-top:8px"></div>
   </div>
 
@@ -996,8 +1002,51 @@ var GH = {
             function() { GH.keys = {}; throw new Error("Wrong passphrase, or the data is damaged"); });
   },
 
-  // Same envelope as ci/state_store.py; one salt + key per page session
+  // Restore a checked backup (readBackupFile) into the Gist: saves the
+  // current data as a download first, writes state.enc and dashboard.enc,
+  // and drops pending phone edits (they were made against the old data)
+  DASHBOARD_PATHS: ["logs/latest.json", "watchlist.csv", "logs/performance_log.json", "logs/closed_positions.json",
+    "logs/performance_history.json", "logs/premarket_brief.json", "logs/thesis_log.json", "logs/outcome_log.json",
+    "logs/correlation_matrix.json", "logs/stock_insight_status.json", "logs/agent_run_status.json",
+    "logs/premarket_status.json", "logs/universe_refresh_status.json", "logs/trade_history.json",
+    "logs/simulator_state.json", "logs/inbox_log.json"],
+
+  restore: function(b) {
+    var pass = GH.pass();
+    var busyCheck = GH.cfg().runToken ? GH.latestRun().then(function(run) {
+      if (run && run.status !== "completed") throw new Error("a GitHub job is running — wait for it to finish");
+    }, function() {}) : Promise.resolve();
+    return busyCheck
+      .then(function() { return GH.stateBlob(); })
+      .then(function(blob) { return saveBlob(blob, backupName("-before-restore")); }, function(err) {
+        if (/no data yet/.test(err.message)) return null;          // nothing to keep
+        throw err;
+      })
+      .then(function() {
+        var dec = new TextDecoder(), bundle = {files: {}};
+        GH.DASHBOARD_PATHS.forEach(function(p) { if (b.files[p]) bundle.files[p] = dec.decode(b.files[p]); });
+        return Promise.all([GH.encryptBytes(b.gz, pass), GH.encrypt(bundle, pass), GH.encrypt({ops: []}, pass)]);
+      })
+      .then(function(t) {
+        var c = GH.cfg();
+        return GH.origFetch(GH.API + "/gists/" + encodeURIComponent(c.gistId), {
+          method: "PATCH",
+          headers: {"Authorization": "token " + c.gistToken, "Accept": "application/vnd.github+json"},
+          body: JSON.stringify({files: {"state.enc": {content: t[0]}, "dashboard.enc": {content: t[1]}, "inbox.enc": {content: t[2]}}})
+        });
+      })
+      .then(function(r) {
+        if (!r.ok) throw new Error(GH.apiError(r.status));
+        GH.bundle = null; GH.version = null; GH.ops = [];
+      });
+  },
+
   encrypt: function(obj, passphrase) {
+    return GH.encryptBytes(new TextEncoder().encode(JSON.stringify(obj)), passphrase);
+  },
+
+  // Same envelope as ci/state_store.py; one salt + key per page session
+  encryptBytes: function(bytes, passphrase) {
     var subtle = window.crypto.subtle;
     var b64 = function(u8) { var s = ""; for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); };
     if (!GH.encKey) {
@@ -1010,7 +1059,7 @@ var GH = {
     }
     var iv = crypto.getRandomValues(new Uint8Array(12));
     return GH.encKey.keyP.then(function(key) {
-      return subtle.encrypt({name: "AES-GCM", iv: iv}, key, new TextEncoder().encode(JSON.stringify(obj)));
+      return subtle.encrypt({name: "AES-GCM", iv: iv}, key, bytes);
     }).then(function(ct) {
       return JSON.stringify({v: 1, kdf: "PBKDF2-SHA256", iter: 310000, salt: b64(GH.encKey.salt), iv: b64(iv), ct: b64(new Uint8Array(ct))});
     });
@@ -1435,6 +1484,8 @@ if (GH_MODE) {
   window.addEventListener("load", function() {
     var of = document.getElementById("open-file-lbl");   // no local files on the phone
     if (of) of.style.display = "none";
+    var rt = document.getElementById("restore-target");
+    if (rt) rt.textContent = "your GitHub data";
     var lbl = document.getElementById("live-lbl");
     if (lbl) lbl.onclick = function() {
       if (confirm("Reconnect to your Gist? (Cancel keeps the current connection)")) GH.disconnect();
@@ -4798,30 +4849,99 @@ function renderDecisionLog() {
 // /backup. Uses the save dialog where the browser has one (choose a folder).
 function downloadBackup() {
   var st = document.getElementById("backup-status");
-  var d = new Date(), pad = function(n) { return ("0" + n).slice(-2); };
-  var name = "market-agent-backup-" + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + ".tar.gz";
+  var name = backupName();
   st.style.color = "#0EA5C9"; st.textContent = "⏳ Preparing backup…";
   var blobP = GH_MODE ? GH.stateBlob()
     : fetch(SERVER_BASE + "/api/backup", {headers: {"X-Token": TRIGGER_TOKEN}, cache: "no-store"})
         .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.blob(); });
-  blobP.then(function(blob) {
-    if (window.showSaveFilePicker) {
-      return window.showSaveFilePicker({suggestedName: name, types: [{description: "Market Agent backup", accept: {"application/gzip": [".tar.gz", ".gz"]}}]})
-        .then(function(h) { return h.createWritable(); })
-        .then(function(w) { return w.write(blob).then(function() { return w.close(); }); })
-        .then(function() { return name; });
-    }
-    var a = document.createElement("a");
-    a.href = URL.createObjectURL(blob); a.download = name;
-    document.body.appendChild(a); a.click();
-    setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
-    return name;
-  }).then(function(saved) {
+  blobP.then(function(blob) { return saveBlob(blob, name); }).then(function(saved) {
     st.style.color = "#00C896";
     st.textContent = "✅ Saved " + saved + " — not encrypted, keep it private";
   }).catch(function(err) {
     if (err && err.name === "AbortError") { st.textContent = ""; return; }   // save dialog cancelled
     st.style.color = "#FF4D6A"; st.textContent = "⚠️ Backup failed: " + err.message;
+  });
+}
+
+function backupName(suffix) {
+  var d = new Date(), pad = function(n) { return ("0" + n).slice(-2); };
+  return "market-agent-backup-" + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+         (suffix ? "_" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + suffix : "") + ".tar.gz";
+}
+
+function saveBlob(blob, name) {
+  if (window.showSaveFilePicker) {
+    return window.showSaveFilePicker({suggestedName: name, types: [{description: "Market Agent backup", accept: {"application/gzip": [".tar.gz", ".gz"]}}]})
+      .then(function(h) { return h.createWritable(); })
+      .then(function(w) { return w.write(blob).then(function() { return w.close(); }); })
+      .then(function() { return name; });
+  }
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  return Promise.resolve(name);
+}
+
+// Reads and checks a backup file in the browser (same rules as
+// local/restore_local.sh): only watchlist.csv, logs/ and data/, no absolute
+// paths or "..", and a watchlist. Returns {gz, files: {path: bytes}, count}.
+function readBackupFile(file) {
+  if (!window.DecompressionStream) return Promise.reject(new Error("this browser can't open .tar.gz files — use the laptop"));
+  return file.arrayBuffer().then(function(buf) {
+    var gz = new Uint8Array(buf);
+    return new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer()
+      .then(function(t) { return {gz: gz, tar: new Uint8Array(t)}; }, function() { throw new Error("not a .tar.gz backup"); });
+  }).then(function(r) {
+    var tar = r.tar, files = {}, count = 0, off = 0, paxPath = null;
+    var str = function(a, b) { var s = ""; for (var i = a; i < b && tar[i]; i++) s += String.fromCharCode(tar[i]); return s; };
+    while (off + 512 <= tar.length) {
+      if (tar[off] === 0) break;                                   // end-of-archive blocks
+      var name = str(off, off + 100), prefix = str(off + 345, off + 500);
+      var size = parseInt(str(off + 124, off + 136).trim() || "0", 8), type = String.fromCharCode(tar[off + 156] || 48);
+      var body = tar.subarray(off + 512, off + 512 + size);
+      off += 512 + Math.ceil(size / 512) * 512;
+      if (type === "x") { var m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(new TextDecoder().decode(body)); paxPath = m ? m[1] : null; continue; }
+      if (type === "g") continue;
+      var path = paxPath || (prefix ? prefix + "/" + name : name); paxPath = null;
+      path = path.replace(/^\.\//, "");
+      var leaf = path.split("/").pop();
+      if (!path || path === "." || leaf.indexOf("._") === 0) continue;   // macOS metadata
+      if (path[0] === "/" || path.split("/").indexOf("..") >= 0 || ["watchlist.csv", "logs", "data"].indexOf(path.split("/")[0]) < 0
+          || (type !== "0" && type !== "\0" && type !== "5")) throw new Error("not a Market Agent backup (unexpected entry " + path + ")");
+      if (type !== "5") { files[path] = body.slice(); count++; }
+    }
+    if (!files["watchlist.csv"]) throw new Error("not a Market Agent backup: no watchlist.csv inside");
+    return {gz: r.gz, files: files, count: count};
+  });
+}
+
+function restoreBackup(input) {
+  var file = input.files && input.files[0];
+  input.value = "";
+  if (!file) return;
+  var st = document.getElementById("backup-status");
+  st.style.color = "#0EA5C9"; st.textContent = "⏳ Checking " + file.name + "…";
+  readBackupFile(file).then(function(b) {
+    var where = GH_MODE ? "your GitHub data (the encrypted Gist)" : "this laptop's data";
+    var answer = "";
+    try {
+      answer = prompt("Replace " + where + " with " + file.name + " (" + b.count + " files)?\n\n" +
+                      "A copy of the current data is saved first" + (GH_MODE ? " (it downloads now)" : " (in ~/Documents/Market Agent Backups)") +
+                      ".\n\nType RESTORE to continue:") || "";
+    } catch(e) {}
+    if (answer.trim() !== "RESTORE") { st.style.color = "#8BA3BC"; st.textContent = "Not restored"; return; }
+    st.textContent = "⏳ Saving a copy of the current data…";
+    var done = GH_MODE ? GH.restore(b) :
+      fetch(SERVER_BASE + "/api/restore", {method: "POST", headers: {"X-Token": TRIGGER_TOKEN, "Content-Type": "application/gzip"}, body: b.gz})
+        .then(function(r) { return r.json().then(function(j) { if (!r.ok) throw new Error(j.message || ("HTTP " + r.status)); return j; }); });
+    return done.then(function() {
+      st.style.color = "#00C896"; st.textContent = "✅ Restored " + b.count + " files from " + file.name + " — reloading…";
+      showToast("♻️ Backup restored");
+      setTimeout(function() { location.reload(); }, 1500);
+    });
+  }).catch(function(err) {
+    st.style.color = "#FF4D6A"; st.textContent = "⚠️ Not restored: " + err.message;
   });
 }
 
