@@ -205,6 +205,18 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .wl-table th{font-size:9px;color:#4585B7;text-transform:uppercase;letter-spacing:0.07em;font-weight:700;padding:7px 8px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.05)}
 .wl-table td{font-size:11px;color:#5A8AAA;padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.03);vertical-align:middle;font-family:'JetBrains Mono',monospace}
 .wl-table tr:hover td{background:rgba(14,165,201,0.03)}
+/* Backup card (Run tab) */
+.bk-card{background:rgba(10,21,32,0.7);border:1px solid rgba(255,255,255,0.05);border-radius:10px;padding:10px 12px;margin-bottom:10px}
+.bk-row{display:flex;gap:8px}
+.bk-btn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:9px 10px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;box-sizing:border-box;font-family:inherit;line-height:1}
+.bk-dl{border:1px solid rgba(14,165,201,0.3);background:rgba(14,165,201,0.1);color:#38BDF8}
+.bk-rs{border:1px solid rgba(240,165,0,0.3);background:rgba(240,165,0,0.07);color:#F0A500}
+.bk-btn:hover{filter:brightness(1.15)}
+.bk-hint{font-size:10px;color:#6690B2;margin-top:8px;line-height:1.5;display:grid;gap:3px}
+.bk-k{color:#8BB8D8;font-weight:700}
+.bk-hint code{font-size:9px}
+.bk-status{font-size:11px;text-align:center;margin-top:6px}
+.bk-status:empty{display:none}
 /* Folded phone (Fold cover, < 560px): each watchlist row becomes a small card,
    three values per line, instead of a 9-column table scrolled sideways. */
 @media (max-width:559px){
@@ -804,25 +816,24 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     <div id="universe-refresh-status" style="font-size:11px;color:#BD6FFF;text-align:center;min-height:14px;margin-top:8px"></div>
   </div>
 
-  <div class="sec-lbl">💾 Backup</div>
-  <div style="background:rgba(10,21,32,0.7);border:1px solid rgba(255,255,255,0.05);border-radius:10px;padding:12px 16px;margin-bottom:10px">
-    <div style="font-size:11px;color:#8BA3BC;line-height:1.6;margin-bottom:10px">
-      Saves all your data (watchlist, trades, simulator, logs) as one dated file,
-      <code>market-agent-backup-YYYY-MM-DD.tar.gz</code>. It is <b>not encrypted</b>: keep it private.
-      <b>Restore</b> replaces the data this dashboard uses (here: <span id="restore-target">this laptop</span>)
-      with a backup file, after saving a copy of the current data. Backups from GitHub and from the
-      laptop are interchangeable.
+  <div class="sec-lbl">💾 Backup &amp; Restore</div>
+  <div class="bk-card">
+    <div class="bk-row">
+      <button id="backup-btn" class="bk-btn bk-dl" onclick="downloadBackup()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>
+        Backup
+      </button>
+      <label id="restore-btn" class="bk-btn bk-rs">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4"/><path d="M7 9l5-5 5 5"/><path d="M5 20h14"/></svg>
+        Restore…
+        <input type="file" accept=".gz,.tgz,application/gzip" style="display:none" onchange="restoreBackup(this)">
+      </label>
     </div>
-    <button id="backup-btn" onclick="downloadBackup()"
-      style="width:100%;padding:12px 6px;border:none;border-radius:10px;background:linear-gradient(135deg,#0B4F6C,#0EA5C9);color:#E8F8FF;font-size:13px;font-weight:700;cursor:pointer">
-      💾 Download backup
-    </button>
-    <label id="restore-btn"
-      style="display:block;box-sizing:border-box;width:100%;margin-top:8px;padding:12px 6px;border:1px solid rgba(240,165,0,0.35);border-radius:10px;background:rgba(240,165,0,0.06);color:#F0A500;font-size:13px;font-weight:700;cursor:pointer;text-align:center">
-      ♻️ Restore backup…
-      <input type="file" accept=".gz,.tgz,application/gzip" style="display:none" onchange="restoreBackup(this)">
-    </label>
-    <div id="backup-status" style="font-size:11px;color:#8BA3BC;text-align:center;min-height:14px;margin-top:8px"></div>
+    <div class="bk-hint">
+      <div><b class="bk-k">Backup</b> saves all your data (watchlist, trades, simulator, logs) as one dated <code>.tar.gz</code> file. Not encrypted: keep it private.</div>
+      <div><b class="bk-k">Restore</b> replaces the current data with a backup file, after saving a copy of what's there now.</div>
+    </div>
+    <div id="backup-status" class="bk-status"></div>
   </div>
 
   <div class="sec-lbl">⏰ US Market Hours (Oman Time)</div>
@@ -1484,8 +1495,6 @@ if (GH_MODE) {
   window.addEventListener("load", function() {
     var of = document.getElementById("open-file-lbl");   // no local files on the phone
     if (of) of.style.display = "none";
-    var rt = document.getElementById("restore-target");
-    if (rt) rt.textContent = "your GitHub data";
     var lbl = document.getElementById("live-lbl");
     if (lbl) lbl.onclick = function() {
       if (confirm("Reconnect to your Gist? (Cancel keeps the current connection)")) GH.disconnect();
